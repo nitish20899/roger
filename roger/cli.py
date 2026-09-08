@@ -15,7 +15,7 @@ import httpx
 
 from . import __version__
 from .config import STATIC_DIR, Settings, load_env
-from .sessions import list_sessions, sessions_dir
+from .sessions import find_session, list_sessions, sessions_dir
 
 
 def setup_logging(s: Settings) -> None:
@@ -132,8 +132,9 @@ def cmd_sessions(project_dir: str | None) -> None:
         fail(f"no Claude Code sessions found for {project} (looked in {sessions_dir(project)})", code=1)
     print(f"Claude Code sessions for {project} (newest first):\n")
     for r in rows:
-        print(f"{r.id}  {r.size_mb:6.1f} MB  {r.age_h:7.1f} h ago  {r.lines:6d} lines  {r.first_message}")
-    print("\nPut one in .env as CLAUDE_SESSION_ID=<id> and set PROJECT_DIR to the project path above.")
+        name = f"[{r.title}]  " if r.title else ""
+        print(f"{r.id}  {r.size_mb:6.1f} MB  {r.age_h:7.1f} h ago  {r.lines:6d} lines  {name}{r.first_message}")
+    print("\nUse one with `roger run <url> --session <id or title> --project <that path>`, or put CLAUDE_SESSION_ID and PROJECT_DIR in .env.")
 
 
 def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
@@ -188,9 +189,12 @@ def apply_deep_flags(s: Settings, session: str | None, project: str | None) -> N
         session = rows[0].id
         print(f"attaching the newest Claude Code session for {project_dir}: {session[:8]}  ({rows[0].age_h:.1f} h old: {rows[0].first_message[:60]})")
     elif session:
-        f = sessions_dir(project_dir) / f"{session}.jsonl"
-        if not f.exists():
-            fail(f"session {session} not found for {project_dir} (looked for {f}); run `roger sessions <project-dir>` to list ids")
+        found = find_session(project_dir, session)
+        if not found:
+            fail(f"no session matching {session!r} for {project_dir} (looked in {sessions_dir(project_dir)}); run `roger sessions <project-dir>` to see ids and titles")
+        if found.id != session:
+            print(f"attaching Claude Code session {found.id[:8]}  [{found.title or found.first_message[:60]}]")
+        session = found.id
     s.attach_session(session, project)
 
 
@@ -204,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True, metavar="command")
 
     def deep_flags(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--session", metavar="ID", help="Claude Code session to attach as the deep brain; 'latest' picks the newest one for the project (overrides CLAUDE_SESSION_ID)")
+        parser.add_argument("--session", metavar="ID", help="Claude Code session to attach as the deep brain: an id (or its first characters), a session title, or 'latest' for the newest one in the project (overrides CLAUDE_SESSION_ID)")
         parser.add_argument("--project", metavar="DIR", help="project folder of that session, or any repo for a fresh read-only session (overrides PROJECT_DIR)")
 
     sp = sub.add_parser("run", help="start everything, send the bot into a meeting, leave when you press Ctrl-C")
