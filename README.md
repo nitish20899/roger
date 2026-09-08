@@ -123,8 +123,20 @@ newest session for it (see [Attach your Claude Code session](#attach-your-claude
 roger run https://meet.google.com/xxx-xxxx-xxx --session latest --project ~/code/my-project
 ```
 
-Teams and Zoom links work the same way. Zoom additionally requires Zoom app credentials configured in your Attendee
-account, see the [Attendee docs](https://docs.attendee.dev).
+Teams and Zoom links work the same way; see [Platform notes](#platform-notes) for the differences.
+
+## Platform notes
+
+| | Google Meet | Microsoft Teams | Zoom |
+|---|---|---|---|
+| Join | guest; admit it from the "someone wants to join" prompt | guest; the organizer admits it from the lobby | needs Zoom app credentials in your Attendee account ([docs](https://docs.attendee.dev)) |
+| Link | `https://meet.google.com/xxx-xxxx-xxx` | the link from the invite. If Attendee rejects a short `teams.microsoft.com/meet/...` link, use the long `teams.microsoft.com/l/meetup-join/...` one from "Join the meeting now" | the invite link with its passcode |
+| Who is talking | per-participant audio, so the transcript has names | Teams exposes one mixed stream, so speakers show as "Someone"; everything else works (wake word, follow-ups, chat) | per-participant audio |
+| Chat, orb webcam, voice | yes | yes; if the tenant blocks the webcam page Roger falls back to plain audio | yes |
+
+Company tenants often restrict guests. If the bot never leaves `waiting_room`, ask the organizer to admit it. For tenants
+that refuse guests entirely, create a signed-in bot account in Attendee (Settings > Bot Logins) and set
+`ATTENDEE_USE_LOGIN=1` (and `ATTENDEE_LOGIN_GROUP` if you have several); Roger then joins Teams and Meet with that account.
 
 ## Talking to Roger
 
@@ -173,7 +185,13 @@ Without a session id but with `PROJECT_DIR` set, Roger starts a fresh read-only 
 briefs itself from the repository.
 
 Authentication: by default the deep brain uses your existing Claude Code login (`DEEP_AUTH=subscription`). Set
-`DEEP_AUTH=api` to bill `ANTHROPIC_API_KEY` instead. The model is `DEEP_MODEL` (default `claude-sonnet-5`).
+`DEEP_AUTH=api` to bill `ANTHROPIC_API_KEY` instead. The model is `DEEP_MODEL` (default `sonnet`).
+
+The fork runs with the project's own Claude Code settings (`.claude/settings.json` and `settings.local.json` in
+`PROJECT_DIR`), so a project that routes Claude Code through Bedrock, Vertex or a Databricks gateway keeps doing so in
+the meeting. Keep `DEEP_MODEL` an alias (`sonnet`, `opus`) in that case, because it is mapped through the project's
+`ANTHROPIC_DEFAULT_*_MODEL` settings. Very long sessions are compacted before the first answer; run `/compact` in the
+session beforehand to make the start faster.
 
 ## Commands
 

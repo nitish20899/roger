@@ -30,7 +30,7 @@ class Bridge:
     def __init__(self, s: Settings) -> None:
         self.s = s
         self.tts = TTS(s)
-        self.speaker = Speaker(self.tts, s.audio_out)
+        self.speaker = Speaker(self.tts, s)
         self.attendee = Attendee(s)
         self.fast = make_fast_responder(s)
         self.transcript = Transcript()
@@ -110,6 +110,11 @@ class Bridge:
                 cache.write_text(self.briefing)
         except Exception as e:
             log.warning("deep: not available: %s", e)
+            msg = str(e).lower()
+            if "authenticate" in msg or "unauthorized" in msg or "403" in msg or "401" in msg:
+                log.warning("deep: the project's Claude Code login or gateway rejected the request. If this project routes Claude Code through a company gateway (Bedrock, Vertex, Databricks), check that you are on its network/VPN and that `claude` works in %s.", self.s.project_dir)
+            if "too long" in msg:
+                log.warning("deep: the session's context is very long; run /compact in that Claude Code session, then start Roger again.")
             self.deep = None
 
     # ------------------------------------------------------------------ audio in

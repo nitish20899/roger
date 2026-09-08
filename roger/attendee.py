@@ -46,11 +46,17 @@ class Attendee:
         if self.s.orb:
             mute = "&mute=1" if self.s.audio_out == "ws" else ""
             body["voice_agent_settings"] = {"url": f"{public_url}/orb?mic=1{mute}"}
+        if self.s.attendee_use_login:
+            # Signed-in bot accounts (Attendee dashboard: Settings > Bot Logins) for tenants that block guests.
+            key = "teams_settings" if "teams.microsoft.com" in meeting_url else "google_meet_settings" if "meet.google.com" in meeting_url else None
+            if key:
+                body[key] = {"use_login": True, **({"login_group_name": self.s.attendee_login_group} if self.s.attendee_login_group else {})}
 
         r = await self.http.post(f"{self.s.attendee_base}/bots", json=body)
         if r.status_code >= 300 and "voice_agent_settings" in body:
-            log.warning("create with voice_agent_settings failed %s: %s; retrying without the orb", r.status_code, r.text[:200])
+            log.warning("create with voice_agent_settings failed %s: %s; retrying without the orb (voice over the websocket instead)", r.status_code, r.text[:200])
             body.pop("voice_agent_settings")
+            self.s.audio_out = "ws"  # nothing will render the page, so the voice must go over the audio websocket
             r = await self.http.post(f"{self.s.attendee_base}/bots", json=body)
         if r.status_code >= 300 and self.s.per_participant_audio:
             log.warning("create with per-participant audio failed %s: %s; retrying with mixed audio only", r.status_code, r.text[:200])

@@ -63,6 +63,8 @@ class Settings:
     # meeting bot (Attendee)
     attendee_api_key: str | None = None
     attendee_base: str = "https://app.attendee.dev/api/v1"
+    attendee_use_login: bool = False  # join Teams / Meet with a signed-in bot account configured in Attendee
+    attendee_login_group: str | None = None
 
     # voice (ElevenLabs)
     elevenlabs_api_key: str | None = None
@@ -102,7 +104,7 @@ class Settings:
     deep_enabled: bool = False
     claude_session_id: str | None = None
     project_dir: str = field(default_factory=lambda: str(Path.cwd()))
-    deep_model: str = "claude-sonnet-5"
+    deep_model: str = "sonnet"  # an alias resolves correctly on Anthropic and on gateways (Bedrock, Vertex, Databricks)
     deep_auth: str = "subscription"  # or "api": bill ANTHROPIC_API_KEY instead of the Claude Code login
 
     # ------------------------------------------------------------------ construction
@@ -115,6 +117,8 @@ class Settings:
 
         s.attendee_api_key = env("ATTENDEE_API_KEY")
         s.attendee_base = (env("ATTENDEE_BASE", s.attendee_base) or s.attendee_base).rstrip("/")
+        s.attendee_use_login = flag("ATTENDEE_USE_LOGIN", False)
+        s.attendee_login_group = env("ATTENDEE_LOGIN_GROUP")
 
         s.elevenlabs_api_key = env("ELEVENLABS_API_KEY")
         s.voice_id = env("ELEVENLABS_VOICE_ID", s.voice_id)

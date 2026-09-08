@@ -11,6 +11,7 @@ from typing import Callable, Optional
 from aiohttp import web
 
 from .audio import CHUNK_BYTES, SAMPLE_RATE
+from .config import Settings
 from .text import norm_text, speech_clean
 from .tts import TTS
 
@@ -27,9 +28,9 @@ class Speaker:
     webcam and, in ``audio_out == "page"`` mode, its actual microphone.
     """
 
-    def __init__(self, tts: TTS, audio_out: str = "page") -> None:
+    def __init__(self, tts: TTS, s: Settings) -> None:
         self.tts = tts
-        self.audio_out = audio_out
+        self.s = s  # s.audio_out is read on every frame: it can flip to "ws" if the bot joins without the orb page
         self.bot_ws: Optional[web.WebSocketResponse] = None
         self.monitors: set[web.WebSocketResponse] = set()
         self.queue: asyncio.Queue[tuple[str, Optional[bytes]]] = asyncio.Queue()
@@ -74,7 +75,7 @@ class Speaker:
         ahead = self._play_head - now
         if ahead > OUTPUT_LEAD_S:
             await asyncio.sleep(ahead - OUTPUT_LEAD_S)
-        await self._send_all(bot if self.audio_out == "ws" else None, mon)
+        await self._send_all(bot if self.s.audio_out == "ws" else None, mon)
         self._play_head += len(chunk) / (SAMPLE_RATE * 2)
 
     async def set_state(self, state: str) -> None:
