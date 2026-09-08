@@ -7,6 +7,7 @@ import httpx
 
 from .audio import CHUNK_BYTES, SAMPLE_RATE
 from .config import Settings
+from .elevenlabs import exhausted_message
 
 
 class TTS:
@@ -39,6 +40,8 @@ class TTS:
         ) as r:
             if r.status_code != 200:
                 detail = (await r.aread()).decode(errors="replace")[:300]
+                if "quota_exceeded" in detail:
+                    raise RuntimeError(exhausted_message("Roger cannot speak"))
                 raise RuntimeError(f"ElevenLabs TTS {r.status_code}: {detail}")
             async for chunk in r.aiter_bytes(CHUNK_BYTES):
                 if chunk:

@@ -74,7 +74,7 @@ The full design, with latency budgets and the reasoning behind each choice, is i
 | Service | What it is for | Where to get the key |
 |---|---|---|
 | [Attendee](https://app.attendee.dev) | the participant that joins the meeting | sign up, then *Settings > API keys*. Free hours to start, hourly after that |
-| [ElevenLabs](https://elevenlabs.io) | hearing (Scribe v2 Realtime) and voice (Flash v2.5) | profile > *API keys*. A paid plan is recommended; the free tier runs out of characters quickly |
+| [ElevenLabs](https://elevenlabs.io) | hearing (Scribe v2 Realtime) and voice (Flash v2.5) | profile > *API keys*. A paid plan is required in practice: the free tier's 10,000 credits are shared by hearing and speaking and last about one short test |
 | [OpenAI](https://platform.openai.com) **or** [Anthropic](https://console.anthropic.com) | the fast spoken replies and the "is this for me?" classifier | API keys page. One of the two is enough |
 
 ### 2. Install
@@ -272,6 +272,7 @@ AUDIO_OUT=ws roger serve && python scripts/loop_test.py   # pretends to be the m
 | Symptom | Fix |
 |---|---|
 | `roger doctor` reports a missing key | edit `.env`; the file is loaded from the current directory, then the repo root, then `~/.roger/.env`, or pass `--env path` |
+| Log says `ElevenLabs credits exhausted`, or `quota_exceeded` / `insufficient_funds` | the ElevenLabs plan is out of credits, so Roger can neither hear nor speak. `roger doctor` shows the balance; add credits or upgrade at elevenlabs.io/app/subscription |
 | `roger` stops working with `ModuleNotFoundError: No module named 'roger'` after an editable install on macOS | some Macs flag files inside `.venv` as hidden, and Python 3.11.14+ skips hidden `.pth` files, which is how editable installs are found. Either `chflags nohidden .venv/lib/python3.*/site-packages/*.pth`, or use a plain `pip install .` |
 | "cloudflared did not report a URL" | check `cloudflared tunnel --url http://localhost:8787` by hand; or set `PUBLIC_URL` to your own public URL |
 | The bot joins but never hears anything | `roger status`: `bot_audio_ws` must be true. Attendee needs to reach your public URL over `wss://` |

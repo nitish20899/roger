@@ -11,8 +11,11 @@ import websockets
 
 from .audio import CHUNK_BYTES, SAMPLE_RATE
 from .config import Settings
+from .elevenlabs import exhausted_message
 
 log = logging.getLogger("roger.stt")
+
+QUOTA_BACKOFF_S = 60
 
 TextCallback = Callable[[str], Awaitable[None]]
 
@@ -32,6 +35,7 @@ class STT:
         self.buf = bytearray()
         self.task: Optional[asyncio.Task] = None
         self.connected = asyncio.Event()
+        self.quota_exhausted = False
 
     def url(self) -> str:
         params = {
@@ -81,17 +85,26 @@ class STT:
                             if msg.get("text"):
                                 await self.on_partial(msg["text"])
                         elif mt == "committed_transcript":
+                            self.quota_exhausted = False
                             if msg.get("text"):
                                 await self.on_committed(msg["text"])
                         elif mt == "session_started":
                             log.info("session %s", msg.get("session_id"))
-                        elif (mt and mt.endswith("error")) or mt in ("quota_exceeded", "rate_limited", "queue_overflow", "commit_throttled"):
+                        elif mt == "quota_exceeded" or "insufficient_funds" in str(msg):
+                            if not self.quota_exhausted:
+                                log.error("%s. Retrying every %d s.", exhausted_message("Roger cannot hear"), QUOTA_BACKOFF_S)
+                            self.quota_exhausted = True
+                            break
+                        elif (mt and mt.endswith("error")) or mt in ("rate_limited", "queue_overflow", "commit_throttled"):
                             log.warning("%s %s", mt, msg.get("error"))
             except Exception as e:
-                log.warning("connection error: %s (retry in %.0fs)", e, backoff)
+                if "insufficient_funds" in str(e) or "quota" in str(e).lower():
+                    self.quota_exhausted = True
+                elif not self.quota_exhausted:
+                    log.warning("connection error: %s (retry in %.0fs)", e, backoff)
             self.connected.clear()
             self.ws = None
-            await asyncio.sleep(backoff)
+            await asyncio.sleep(QUOTA_BACKOFF_S if self.quota_exhausted else backoff)
             backoff = min(backoff * 2, 15)
 
     async def close(self) -> None:

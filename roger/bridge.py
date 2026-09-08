@@ -13,6 +13,7 @@ from .attention import Attention, make_anthropic_classifier, make_openai_classif
 from .audio import rms
 from .config import Settings
 from .deep import DeepAgent
+from .elevenlabs import fetch_quota_async
 from .fast import make_fast_responder
 from .prompts import BRIDGE_PHRASES, ERROR_LINE, NO_BRIEFING, NO_DEEP_LINE, fast_system, greeting
 from .speaker import Speaker
@@ -44,6 +45,7 @@ class Bridge:
         self.bot_state: Optional[str] = None
         self.attention = Attention(s.bot_first_name, s.wake_words, classify=self._make_classifier(), window_s=s.attention_window_s)
         self.speaker.on_said = self.attention.note_bot_turn
+        self.eleven_low = False
         # speaker attribution from per-participant audio energy
         self.energy: dict[str, list[tuple[float, float]]] = {}  # participant uuid -> [(time, rms)]
         self.names: dict[str, str] = {}
@@ -74,9 +76,23 @@ class Bridge:
         except Exception as e:
             log.warning("attendee: adopt failed: %s", e)
         if self.s.elevenlabs_api_key:
-            asyncio.create_task(self._prerender_clips())
+            asyncio.create_task(self._check_credits())
         if self.s.deep_enabled:
             asyncio.create_task(self._start_deep())
+
+    async def _check_credits(self) -> None:
+        """Fail loudly before the meeting if ElevenLabs is about to run dry; otherwise warm up the bridge clips."""
+        try:
+            q = await fetch_quota_async(self.tts.http, self.s.elevenlabs_api_key)
+        except Exception as e:
+            log.debug("elevenlabs: quota check failed: %s", e)
+            await self._prerender_clips()
+            return
+        if q.low:
+            log.error("elevenlabs: %s. Roger will not be able to hear or speak. Add credits or upgrade at https://elevenlabs.io/app/subscription", q.describe())
+            return
+        log.info("elevenlabs: %s", q.describe())
+        await self._prerender_clips()
 
     async def close(self) -> None:
         if self.deep:

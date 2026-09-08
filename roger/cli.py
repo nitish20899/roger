@@ -15,6 +15,7 @@ import httpx
 
 from . import __version__
 from .config import STATIC_DIR, Settings, load_env
+from .elevenlabs import BILLING_URL, fetch_quota
 from .sessions import find_session, list_sessions, sessions_dir
 
 
@@ -144,6 +145,12 @@ def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
     lines.append((ok if env_files else bad, ".env", ", ".join(map(str, env_files)) if env_files else "not found: copy .env.example to .env in this directory (or to ~/.roger/.env) and fill in your keys"))
     lines.append((ok if s.attendee_api_key else bad, "Attendee key", "set" if s.attendee_api_key else "missing (https://app.attendee.dev)"))
     lines.append((ok if s.elevenlabs_api_key else bad, "ElevenLabs key", "set" if s.elevenlabs_api_key else "missing (https://elevenlabs.io)"))
+    if s.elevenlabs_api_key:
+        try:
+            q = fetch_quota(s.elevenlabs_api_key)
+            lines.append((bad if q.low else ok, "ElevenLabs credits", q.describe() + (f". Too few for a meeting: add credits at {BILLING_URL}" if q.low else "")))
+        except Exception as e:
+            lines.append((bad, "ElevenLabs credits", f"could not check ({str(e)[:80]}); is the key valid?"))
     fast_key = s.openai_api_key if s.fast_provider == "openai" else s.anthropic_api_key
     lines.append((ok if fast_key else bad, "Fast responder", f"{s.fast_provider} / {s.fast_model}" + ("" if fast_key else f"  ({s.fast_provider.upper()}_API_KEY missing)")))
     lines.append((ok, "Classifier", f"{s.fast_provider} / {s.classifier_model}"))

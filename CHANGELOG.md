@@ -2,6 +2,7 @@
 
 ## 0.1.1 - 2026-09-08
 
+- ElevenLabs credit check in `roger doctor` and at startup; clear errors and a 60 s back-off when credits run out.
 - `DEEP_MODEL` defaults to the `sonnet` alias so projects behind a gateway (Bedrock, Vertex, Databricks) resolve it.
 - `roger sessions` shows session titles; `--session` accepts a title or an id prefix.
 - Platform notes for Teams and Zoom; `ATTENDEE_USE_LOGIN` for signed-in bot accounts; voice falls back to the audio

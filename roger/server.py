@@ -147,7 +147,7 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
 
     async def h_health(_: web.Request) -> web.Response:
         h = bridge.health()
-        h["orb"] = orb_kind()
+        h["orb"] = orb_kind() if s.orb else "off"
         return web.json_response(h)
 
     async def h_index(_: web.Request) -> web.Response:
@@ -193,7 +193,7 @@ async def serve(s: Settings, meeting_url: str | None = None, leave_on_exit: bool
 
     try:
         await bridge.start()
-        log.info("ready: local http://localhost:%d/monitor  public %s  orb=%s", s.port, s.public_url or "(none)", orb_kind())
+        log.info("ready: local http://localhost:%d/monitor  public %s  orb=%s", s.port, s.public_url or "(none)", orb_kind() if s.orb else "off")
         log.info("config: %s", json.dumps(s.summary()))
         if meeting_url:
             bot_id = await bridge.join(meeting_url)
