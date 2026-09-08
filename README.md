@@ -115,6 +115,13 @@ Roger starts the server, opens a tunnel, creates the bot and asks to join. If th
 "Roger" when the prompt appears. It greets the room, drops one line in the chat, and listens. Press `Ctrl-C` to make it
 leave.
 
+To bring the context of the Claude Code session you are working in, add the project folder and let Roger pick the
+newest session for it (see [Attach your Claude Code session](#attach-your-claude-code-session-the-deep-brain)):
+
+```bash
+roger run https://meet.google.com/xxx-xxxx-xxx --session latest --project ~/code/my-project
+```
+
 Teams and Zoom links work the same way. Zoom additionally requires Zoom app credentials configured in your Attendee
 account, see the [Attendee docs](https://docs.attendee.dev).
 
@@ -171,8 +178,9 @@ Authentication: by default the deep brain uses your existing Claude Code login (
 
 | Command | What it does |
 |---|---|
-| `roger run <url> [--session ID\|latest] [--project DIR]` | server + tunnel + join; leaves the meeting on `Ctrl-C` |
+| `roger run <url>` | server + tunnel + join; leaves the meeting on `Ctrl-C` |
 | `roger serve` | server + tunnel only. The bot survives restarts of this process and reconnects |
+| `--session ID` / `--session latest`, `--project DIR` | options of `run` and `serve`: attach a Claude Code session (or the newest one for the project) as the deep brain. They override `CLAUDE_SESSION_ID` and `PROJECT_DIR` from `.env` |
 | `roger join <url>` / `roger leave` | control the bot while `roger serve` is running |
 | `roger say "text"` | make it say something |
 | `roger ask "Roger, ..."` | simulate someone talking to it, no meeting needed |
@@ -187,6 +195,8 @@ reply and per-answer latency.
 ## Configuration
 
 Everything is an environment variable, normally set in `.env`. [`.env.example`](.env.example) documents all of them.
+Precedence is command-line flags (`--session`, `--project`), then variables already in your shell, then `.env`
+(loaded from the current directory, then the repository root; `--env FILE` points at another file).
 The ones that change behaviour most:
 
 | Variable | Default | Meaning |

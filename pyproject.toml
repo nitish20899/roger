@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roger-meeting-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Roger: a voice AI teammate that joins your Google Meet, Microsoft Teams and Zoom calls, listens, talks back and posts to chat."
 readme = "README.md"
 license = { file = "LICENSE" }
