@@ -159,6 +159,16 @@ class Settings:
         s.deep_auth = env("DEEP_AUTH", "api" if s.anthropic_api_key and not s.claude_session_id else "subscription")
         return s
 
+    def attach_session(self, session_id: str | None = None, project_dir: str | None = None) -> None:
+        """Turn the deep brain on for a Claude Code session and/or project folder (command-line overrides)."""
+        if project_dir:
+            self.project_dir = str(Path(project_dir).expanduser().resolve())
+        if session_id:
+            self.claude_session_id = session_id
+        self.deep_enabled = True
+        if not os.getenv("DEEP_AUTH"):
+            self.deep_auth = "subscription"
+
     # ------------------------------------------------------------------ derived
     @property
     def owner_possessive(self) -> str:

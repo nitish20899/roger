@@ -46,3 +46,11 @@ def test_deep_brain_is_off_unless_configured(clean_env):
 def test_no_orb_forces_ws_audio(clean_env):
     clean_env.setenv("ORB", "0")
     assert Settings.from_env().audio_out == "ws"
+
+
+def test_attach_session_from_the_command_line(clean_env, tmp_path):
+    s = Settings.from_env()
+    assert not s.deep_enabled
+    s.attach_session("abc123", str(tmp_path))
+    assert s.deep_enabled and s.claude_session_id == "abc123" and s.project_dir == str(tmp_path.resolve())
+    assert s.deep_auth == "subscription"

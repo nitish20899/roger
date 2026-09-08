@@ -176,6 +176,24 @@ def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
     print("\nAll good. Try: roger run https://meet.google.com/xxx-xxxx-xxx")
 
 
+def apply_deep_flags(s: Settings, session: str | None, project: str | None) -> None:
+    """--session / --project on `run` and `serve`: attach a Claude Code session from the command line."""
+    if not session and not project:
+        return
+    project_dir = str(Path(project).expanduser().resolve()) if project else s.project_dir
+    if session == "latest":
+        rows = list_sessions(project_dir)
+        if not rows:
+            fail(f"no Claude Code sessions found for {project_dir} (looked in {sessions_dir(project_dir)}); pass --project <dir> or a session id")
+        session = rows[0].id
+        print(f"attaching the newest Claude Code session for {project_dir}: {session[:8]}  ({rows[0].age_h:.1f} h old: {rows[0].first_message[:60]})")
+    elif session:
+        f = sessions_dir(project_dir) / f"{session}.jsonl"
+        if not f.exists():
+            fail(f"session {session} not found for {project_dir} (looked for {f}); run `roger sessions <project-dir>` to list ids")
+    s.attach_session(session, project)
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -185,10 +203,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"roger {__version__}")
     sub = p.add_subparsers(dest="command", required=True, metavar="command")
 
+    def deep_flags(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--session", metavar="ID", help="Claude Code session to attach as the deep brain; 'latest' picks the newest one for the project (overrides CLAUDE_SESSION_ID)")
+        parser.add_argument("--project", metavar="DIR", help="project folder of that session, or any repo for a fresh read-only session (overrides PROJECT_DIR)")
+
     sp = sub.add_parser("run", help="start everything, send the bot into a meeting, leave when you press Ctrl-C")
     sp.add_argument("meeting_url", help="Google Meet, Microsoft Teams or Zoom link")
+    deep_flags(sp)
 
-    sub.add_parser("serve", help="start the server (and a Cloudflare quick tunnel) and keep it running")
+    sp = sub.add_parser("serve", help="start the server (and a Cloudflare quick tunnel) and keep it running")
+    deep_flags(sp)
 
     sp = sub.add_parser("join", help="send the bot into a meeting (needs `roger serve` running)")
     sp.add_argument("meeting_url")
@@ -216,6 +240,8 @@ def main(argv: list[str] | None = None) -> None:
     env_files = load_env(args.env)
     s = Settings.from_env()
 
+    if args.command in ("run", "serve"):
+        apply_deep_flags(s, args.session, args.project)
     if args.command == "run":
         cmd_serve(s, args.meeting_url, leave_on_exit=True)
     elif args.command == "serve":

@@ -141,12 +141,21 @@ Roger knows the project, the decisions and the open questions from that session.
 roger sessions ~/code/my-project        # lists sessions, newest first
 ```
 
-Put the id in `.env`:
+Then either pass it on the command line:
+
+```bash
+roger run https://meet.google.com/xxx-xxxx-xxx --session 9ad00b4f-690b-4ce6-afe2-946065e874e3 --project ~/code/my-project
+roger run https://meet.google.com/xxx-xxxx-xxx --session latest --project ~/code/my-project   # newest session for that project
+```
+
+or make it the default in `.env`:
 
 ```bash
 CLAUDE_SESSION_ID=9ad00b4f-690b-4ce6-afe2-946065e874e3
 PROJECT_DIR=~/code/my-project
 ```
+
+Tip: while working in Claude Code, `/status` shows the id of the session you are in.
 
 On start, the session is **forked** (your original is untouched) and asked to write a briefing; the fast responder
 answers from that briefing. Questions that need the repository are delegated to the fork, which may read, grep and
@@ -162,7 +171,7 @@ Authentication: by default the deep brain uses your existing Claude Code login (
 
 | Command | What it does |
 |---|---|
-| `roger run <url>` | server + tunnel + join; leaves the meeting on `Ctrl-C` |
+| `roger run <url> [--session ID\|latest] [--project DIR]` | server + tunnel + join; leaves the meeting on `Ctrl-C` |
 | `roger serve` | server + tunnel only. The bot survives restarts of this process and reconnects |
 | `roger join <url>` / `roger leave` | control the bot while `roger serve` is running |
 | `roger say "text"` | make it say something |
