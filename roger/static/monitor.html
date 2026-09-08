@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__BOT_NAME__ monitor</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f1416; color: #e5ecea; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; overflow: hidden; }
+  .stage { width: 1280px; height: 720px; display: grid; place-items: center; position: relative; }
+  .ring { width: 300px; height: 300px; border-radius: 50%; display: grid; place-items: center;
+          background: radial-gradient(circle at 50% 40%, #16333a 0%, #0f1416 70%); box-shadow: 0 0 0 6px #1d2a2e; transition: box-shadow .25s; }
+  .ring.speaking { box-shadow: 0 0 0 10px #0e7c86, 0 0 60px #0e7c8688; }
+  .ring.thinking { box-shadow: 0 0 0 8px #d2601a, 0 0 40px #d2601a66; }
+  canvas { position: absolute; left: 0; top: 0; }
+  .name { position: absolute; left: 48px; bottom: 44px; font-size: 34px; font-weight: 600; letter-spacing: .01em; }
+  .state { position: absolute; right: 48px; bottom: 48px; font-size: 24px; color: #93a5a3; text-transform: lowercase; }
+  .state::before { content: ""; display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: #93a5a3; margin-right: 12px; vertical-align: middle; }
+  .state.speaking::before { background: #3fb8c0; } .state.thinking::before { background: #f0895a; }
+  .big { font-size: 96px; font-weight: 700; color: #cfe6e8; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <canvas id="wave" width="1280" height="720"></canvas>
+  <div class="ring" id="ring"><div class="big">C</div></div>
+  <div class="name">__BOT_NAME__</div>
+  <div class="state" id="state">connecting</div>
+</div>
+<script>
+(() => {
+  const SR = 16000;
+  const ring = document.getElementById('ring');
+  const stateEl = document.getElementById('state');
+  const canvas = document.getElementById('wave');
+  const g = canvas.getContext('2d');
+
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+  const gain = ctx.createGain(); gain.gain.value = 1.0;
+  gain.connect(analyser); analyser.connect(ctx.destination);
+
+  // keep the context alive in the bot's browser; also resume on any gesture just in case
+  const kick = () => { if (ctx.state !== 'running') ctx.resume().catch(() => {}); };
+  setInterval(kick, 500); document.addEventListener('click', kick);
+
+  let nextTime = 0; const sources = new Set(); const JITTER = 0.15;
+  window.stats = { chunks: 0, samples: 0, ctx }; 
+  function playPCM(b64) {
+    const bin = atob(b64); const n = bin.length >> 1; if (!n) return; window.stats.chunks++; window.stats.samples += n;
+    const buf = ctx.createBuffer(1, n, SR); const ch = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) {
+      let v = bin.charCodeAt(2*i) | (bin.charCodeAt(2*i+1) << 8); if (v >= 0x8000) v -= 0x10000; ch[i] = v / 32768;
+    }
+    const src = ctx.createBufferSource(); src.buffer = buf; src.connect(gain);
+    const start = Math.max(ctx.currentTime + JITTER, nextTime);
+    src.start(start); nextTime = start + buf.duration; sources.add(src); src.onended = () => sources.delete(src);
+  }
+  function stopAll() { sources.forEach(s => { try { s.stop(); } catch (e) {} }); sources.clear(); nextTime = 0; }
+  function setState(s) { stateEl.textContent = s; stateEl.className = 'state ' + s; ring.className = 'ring ' + s; }
+
+  function connect() {
+    const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/monitor';
+    const ws = new WebSocket(url);
+    ws.onopen = () => setState('listening');
+    ws.onmessage = (e) => {
+      if (e.data === 'pong') return;
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.type === 'audio') playPCM(m.pcm);
+      else if (m.type === 'stop') stopAll();
+      else if (m.type === 'state') setState(m.state);
+    };
+    ws.onclose = () => { setState('reconnecting'); setTimeout(connect, 1500); };
+    ws.onerror = () => ws.close();
+  }
+  connect();
+
+  // waveform
+  const data = new Uint8Array(analyser.fftSize);
+  function draw() {
+    requestAnimationFrame(draw);
+    analyser.getByteTimeDomainData(data);
+    g.clearRect(0, 0, canvas.width, canvas.height);
+    g.lineWidth = 3; g.strokeStyle = 'rgba(63,184,192,0.85)'; g.beginPath();
+    const mid = canvas.height / 2, step = canvas.width / data.length;
+    for (let i = 0; i < data.length; i++) { const y = mid + (data[i] - 128) * 1.6; i ? g.lineTo(i * step, y) : g.moveTo(0, y); }
+    g.stroke();
+  }
+  draw();
+})();
+</script>
+</body>
+</html>
