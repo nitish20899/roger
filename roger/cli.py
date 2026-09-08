@@ -140,7 +140,7 @@ def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
     ok, bad = "ok ", "!! "
     lines: list[tuple[str, str, str]] = []
 
-    lines.append((ok if env_files else bad, ".env", ", ".join(map(str, env_files)) if env_files else "not found: copy .env.example to .env and fill in your keys"))
+    lines.append((ok if env_files else bad, ".env", ", ".join(map(str, env_files)) if env_files else "not found: copy .env.example to .env in this directory (or to ~/.roger/.env) and fill in your keys"))
     lines.append((ok if s.attendee_api_key else bad, "Attendee key", "set" if s.attendee_api_key else "missing (https://app.attendee.dev)"))
     lines.append((ok if s.elevenlabs_api_key else bad, "ElevenLabs key", "set" if s.elevenlabs_api_key else "missing (https://elevenlabs.io)"))
     fast_key = s.openai_api_key if s.fast_provider == "openai" else s.anthropic_api_key

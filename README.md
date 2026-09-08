@@ -83,11 +83,12 @@ The full design, with latency budgets and the reasoning behind each choice, is i
 git clone https://github.com/nitish20899/roger.git
 cd roger
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install .
 cp .env.example .env
 ```
 
-Or, with make: `make setup`.
+Or, with make: `make setup`. To hack on Roger itself use an editable install (`pip install -e .` or `make dev`) so
+edits apply without reinstalling; after `git pull` on a plain install, run `pip install .` again.
 
 ### 3. Configure
 
@@ -195,8 +196,9 @@ reply and per-answer latency.
 ## Configuration
 
 Everything is an environment variable, normally set in `.env`. [`.env.example`](.env.example) documents all of them.
-Precedence is command-line flags (`--session`, `--project`), then variables already in your shell, then `.env`
-(loaded from the current directory, then the repository root; `--env FILE` points at another file).
+Precedence is command-line flags (`--session`, `--project`), then variables already in your shell, then `.env`.
+The `.env` file is looked up in the current directory, then the repository root, then `~/.roger/.env`; keep it in
+`~/.roger` to run `roger` from any directory, or pass `--env FILE`.
 The ones that change behaviour most:
 
 | Variable | Default | Meaning |
@@ -251,7 +253,8 @@ AUDIO_OUT=ws roger serve && python scripts/loop_test.py   # pretends to be the m
 
 | Symptom | Fix |
 |---|---|
-| `roger doctor` reports a missing key | edit `.env`; the file is loaded from the current directory, then the repo root, or pass `--env path` |
+| `roger doctor` reports a missing key | edit `.env`; the file is loaded from the current directory, then the repo root, then `~/.roger/.env`, or pass `--env path` |
+| `roger` stops working with `ModuleNotFoundError: No module named 'roger'` after an editable install on macOS | some Macs flag files inside `.venv` as hidden, and Python 3.11.14+ skips hidden `.pth` files, which is how editable installs are found. Either `chflags nohidden .venv/lib/python3.*/site-packages/*.pth`, or use a plain `pip install .` |
 | "cloudflared did not report a URL" | check `cloudflared tunnel --url http://localhost:8787` by hand; or set `PUBLIC_URL` to your own public URL |
 | The bot joins but never hears anything | `roger status`: `bot_audio_ws` must be true. Attendee needs to reach your public URL over `wss://` |
 | It answers its own greeting | the echo filter normally handles this; leave `BARGE_IN_ENERGY=0` |

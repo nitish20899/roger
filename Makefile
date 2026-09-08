@@ -3,14 +3,18 @@ PY ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: setup run serve doctor test orb clean
+.PHONY: setup dev run serve doctor test orb clean
 
 setup: $(BIN)/roger .env   ## create a virtualenv, install Roger, create .env from the example
 	@echo "Now edit .env with your API keys, then: make doctor"
 
-$(BIN)/roger: pyproject.toml
+$(BIN)/roger: pyproject.toml roger/*.py
 	test -d $(VENV) || $(PY) -m venv $(VENV)
 	$(BIN)/pip install --upgrade pip >/dev/null
+	$(BIN)/pip install ".[dev]"
+
+dev: .env              ## editable install for hacking on Roger (changes apply without reinstalling)
+	test -d $(VENV) || $(PY) -m venv $(VENV)
 	$(BIN)/pip install -e ".[dev]"
 
 .env:

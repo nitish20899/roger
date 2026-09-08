@@ -29,11 +29,13 @@ CLASSIFIER_MODEL_DEFAULTS = {"openai": "gpt-4.1-mini", "anthropic": "claude-haik
 def load_env(path: str | None = None) -> list[Path]:
     """Load ``.env`` files without overriding variables already present in the environment.
 
-    Order: an explicit path (or ``$ROGER_ENV``); otherwise ``./.env`` in the current directory and then
-    the repository root (for ``pip install -e .`` checkouts). Returns the files that were loaded.
+    Order: an explicit path (or ``$ROGER_ENV``); otherwise ``./.env`` in the current directory, then the
+    repository root (for ``pip install -e .`` checkouts), then ``~/.roger/.env`` so ``roger`` works from any
+    directory. Returns the files that were loaded.
     """
     explicit = path or os.getenv("ROGER_ENV")
-    candidates = [Path(explicit).expanduser()] if explicit else [Path.cwd() / ".env", REPO_ROOT / ".env"]
+    state_dir = Path(os.getenv("ROGER_STATE_DIR", "~/.roger")).expanduser()
+    candidates = [Path(explicit).expanduser()] if explicit else [Path.cwd() / ".env", REPO_ROOT / ".env", state_dir / ".env"]
     loaded: list[Path] = []
     for p in candidates:
         if p.is_file() and p.resolve() not in {q.resolve() for q in loaded}:

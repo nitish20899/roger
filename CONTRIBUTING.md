@@ -6,7 +6,7 @@ Thanks for looking under the hood. Roger is small enough to read in an afternoon
 
 ```bash
 git clone https://github.com/nitish20899/roger.git && cd roger
-make setup            # venv + editable install + .env from the example
+make dev              # venv + editable install + .env from the example
 make test             # offline tests, no keys needed
 ```
 
