@@ -12,7 +12,7 @@ from typing import Any
 
 from ..base import Participant, State
 from ..browser import Platform, platform
-from ..dom import click_any, fill_any, first_visible, has_text, texts
+from ..dom import click_any, dismiss_all, fill_any, first_visible, has_text, texts
 
 log = logging.getLogger("roger.meeting.teams")
 
@@ -32,6 +32,7 @@ JOIN_BUTTON = [
     '[aria-label*="Join now" i]',
 ]
 CAMERA_OFF = ['[data-tid="toggle-video"][aria-pressed="true"]', 'button[aria-label*="Turn camera off" i]', '[data-tid="prejoin-video-button"][aria-pressed="true"]']
+MIC_ON = ['button[aria-label*="Unmute" i]', '[data-tid="toggle-mute"][aria-pressed="false"]', 'button[aria-label*="Turn microphone on" i]']
 LEAVE_BUTTON = ['[data-tid="hangup-main-btn"]', 'button[aria-label*="Leave" i]', '#hangup-button', 'button[title*="Leave" i]']
 DISMISS = ['button:has-text("Accept all")', 'button:has-text("Reject all")', 'button:has-text("Got it")', 'button[aria-label="Close"]', 'button:has-text("Dismiss")']
 CHAT_TOGGLE = ['[data-tid="chat-button"]', 'button[aria-label*="Chat" i]', '#chat-button']
@@ -60,13 +61,11 @@ class Teams(Platform):
         self._people_open = False
 
     async def prepare(self, page: Any) -> None:
-        for sel in DISMISS:
-            await click_any(page, [sel], timeout_ms=600, what=sel)
+        await dismiss_all(page, DISMISS)
         # The desktop-app interstitial can appear before or after the consent banner, so try it twice.
         if await click_any(page, BROWSER_BUTTON, timeout_ms=6000, what="continue on this browser"):
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
-            for sel in DISMISS:
-                await click_any(page, [sel], timeout_ms=500, what=sel)
+            await dismiss_all(page, DISMISS)
         await click_any(page, GUEST_BUTTON, timeout_ms=2500, what="join as guest")
 
     async def join(self, page: Any, url: str, bot_name: str) -> None:
@@ -76,8 +75,17 @@ class Teams(Platform):
         else:
             log.info("no name field; joining with the browser profile's signed-in account")
         await click_any(page, CAMERA_OFF, timeout_ms=2500, what="camera off")
+        if await click_any(page, MIC_ON, timeout_ms=2500, what="microphone on"):
+            log.info("microphone was muted; turned it on so Roger can be heard")
+        await dismiss_all(page, DISMISS)
         if not await click_any(page, JOIN_BUTTON, timeout_ms=20000, what="join"):
-            raise RuntimeError("Teams: could not find the join button (the page may have changed, or the link needs a signed-in account)")
+            present = await first_visible(page, JOIN_BUTTON, timeout_ms=2000) is not None
+            raise RuntimeError(
+                "Teams: the join button was on screen but could not be clicked (something is covering it)"
+                if present else
+                "Teams: no join button on this page -- the link may need a signed-in account. "
+                "Run with BROWSER_HEADLESS=0 to watch what it sees."
+            )
         log.info("asked to join; waiting to be admitted")
 
     async def poll_state(self, page: Any) -> State | None:

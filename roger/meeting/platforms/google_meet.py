@@ -11,7 +11,7 @@ from typing import Any
 
 from ..base import ChatMessage, Participant, State
 from ..browser import Platform, platform
-from ..dom import click_any, fill_any, first_visible, has_text, texts
+from ..dom import click_any, dismiss_all, fill_any, first_visible, has_text, texts
 
 log = logging.getLogger("roger.meeting.meet")
 
@@ -21,6 +21,9 @@ JOIN_BUTTON = [
     '[role="button"]:has-text("Ask to join")', '[role="button"]:has-text("Join now")',
 ]
 CAMERA_OFF = ['button[aria-label*="Turn off camera" i]', 'div[role="button"][aria-label*="Turn off camera" i]', 'button[data-is-muted="false"][aria-label*="camera" i]']
+# Present only while the microphone is muted, so clicking it is what unmutes. Roger joining muted is the
+# one failure nobody notices from the logs: it looks joined, and simply never speaks.
+MIC_ON = ['button[aria-label*="Turn on microphone" i]', 'div[role="button"][aria-label*="Turn on microphone" i]']
 LEAVE_BUTTON = ['button[aria-label*="Leave call" i]', 'button[aria-label*="Leave the call" i]', '[data-tooltip*="Leave call" i]']
 DISMISS = [
     'button:has-text("Got it")', 'button:has-text("Dismiss")', 'button:has-text("Continue without microphone")',
@@ -53,18 +56,31 @@ class GoogleMeet(Platform):
         self._people_open = False
 
     async def prepare(self, page: Any) -> None:
-        for sel in DISMISS:
-            await click_any(page, [sel], timeout_ms=600, what=sel)
+        await dismiss_all(page, DISMISS)
 
     async def join(self, page: Any, url: str, bot_name: str) -> None:
         # The name field only appears for a guest; a signed-in profile skips straight to the join button.
-        if await fill_any(page, NAME_INPUT, bot_name, timeout_ms=6000):
+        if await fill_any(page, NAME_INPUT, bot_name, timeout_ms=15000):
             log.info("joining as a guest called %r", bot_name)
         else:
-            log.info("joining with the browser profile's signed-in account")
+            log.info("no name field; joining with whatever account this browser profile is signed into")
+
         await click_any(page, CAMERA_OFF, timeout_ms=2500, what="camera off")
+        if await click_any(page, MIC_ON, timeout_ms=2500, what="microphone on"):
+            log.info("microphone was muted; turned it on so Roger can be heard")
+
+        # Meet drops a "Got it" coach-mark over the join button moments after the form is filled, so the
+        # banners are cleared again here rather than only in prepare().
+        await dismiss_all(page, DISMISS)
+
         if not await click_any(page, JOIN_BUTTON, timeout_ms=15000, what="join"):
-            raise RuntimeError("Google Meet: could not find the join button (the page may have changed, or the link is wrong)")
+            present = await first_visible(page, JOIN_BUTTON, timeout_ms=2000) is not None
+            raise RuntimeError(
+                "Google Meet: the join button was on screen but could not be clicked (something is covering it)"
+                if present else
+                "Google Meet: no join button on this page -- the link may be wrong, expired, or the meeting "
+                "may not allow guests. Run with BROWSER_HEADLESS=0 to watch what it sees."
+            )
         log.info("asked to join; waiting to be admitted")
 
     async def poll_state(self, page: Any) -> State | None:

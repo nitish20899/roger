@@ -138,6 +138,7 @@ class BrowserMeeting(MeetingClient):
         self._ctx = None
         self.page: Any = None
         self._linked = False   # the page has said hello over the binding
+        self.audio_state = "unknown"
         self._watch: asyncio.Task | None = None
         self._streams: dict[int, str] = {}  # page stream id -> the WebRTC track id behind it
         self._energy: dict[int, tuple[float, float]] = {}  # stream id -> (last frame time, loudness)
@@ -287,6 +288,12 @@ class BrowserMeeting(MeetingClient):
             # The page tells us what the browser actually gave it; capture is already at our wire rate.
             log.info("page audio: out %s Hz, capture %s Hz", m.get("out_rate"), m.get("in_rate"))
             self.rate = int(m.get("in_rate") or self.rate)
+        elif kind == "audio_state":
+            self.audio_state = f"out={m.get('out')} in={m.get('in')}"
+            if m.get("in") != "running":
+                log.warning("the page's capture audio is %s: Roger cannot hear the meeting until it runs", m.get("in"))
+            else:
+                log.info("page audio running (%s)", self.audio_state)
         elif kind == "track":
             self._streams[int(m["stream_id"])] = str(m.get("track_id") or m["stream_id"])
         elif kind == "track_ended":
@@ -361,6 +368,40 @@ class BrowserMeeting(MeetingClient):
                 log.debug("closing %s: %s", what, e)
         self._ctx = self._pw = self.page = None
 
+    @staticmethod
+    async def sign_in(s: Any, start_url: str = "https://accounts.google.com/") -> None:
+        """Open the browser profile so a human can sign an account into it, once.
+
+        Most Google Workspace meetings refuse anonymous guests outright -- the pre-join form appears, and
+        the join is denied the moment it is clicked. The fix is for Roger's browser to be signed in like
+        any other participant. The profile lives under ROGER_STATE_DIR and is reused on every later run,
+        so this is done once rather than per meeting.
+        """
+        from playwright.async_api import async_playwright
+
+        profile = Path(s.state_dir) / "browser-profile"
+        profile.mkdir(parents=True, exist_ok=True)
+        pw = await async_playwright().start()
+        ctx = await pw.chromium.launch_persistent_context(
+            str(profile), headless=False, args=CHROME_ARGS, viewport={"width": 1280, "height": 900},
+            ignore_default_args=["--enable-automation", "--mute-audio"],
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(start_url, wait_until="domcontentloaded")
+        log.info("sign in in the browser window, then close it. The profile is kept at %s", profile)
+        try:
+            while ctx.pages:
+                await asyncio.sleep(1)
+        except Exception:
+            pass
+        finally:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+            await pw.stop()
+        log.info("signed-in profile saved; `roger run` will use it from now on")
+
     def health(self) -> dict:
         return {
             "provider": self.name,
@@ -370,5 +411,6 @@ class BrowserMeeting(MeetingClient):
             "frames_in": self.frames_in,
             "frames_out": self.frames_out,
             "audio_streams": len(self._streams),
+            "page_audio": self.audio_state,
             "named_streams": dict(self._named),
         }

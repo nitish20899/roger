@@ -281,7 +281,20 @@ def test_the_page_script_is_configured_not_hardcoded():
     js = BrowserMeeting(s)._bridge_js()
     assert "__ROGER_CFG__" not in js, "the config placeholder was left unsubstituted"
     assert '"rate": 24000' in js
-    assert "getUserMedia" in js and "RTCPeerConnection" in js
+    assert "RTCPeerConnection" in js
+
+
+def test_the_voice_is_substituted_at_the_sender_not_at_getusermedia():
+    """Patching getUserMedia crashes Google Meet: it manages its microphone as a real device and a
+    MediaStreamAudioDestinationNode track cannot answer applyConstraints({deviceId:{exact}}).
+
+    The swap happens on RTCRtpSender instead. If anyone reinstates the getUserMedia override, Meet joins
+    stop working a few seconds in, with no error anywhere, so it is asserted here.
+    """
+    js = BrowserMeeting(settings())._bridge_js()
+    code = "\n".join(ln for ln in js.splitlines() if not ln.strip().startswith(("*", "//")))
+    assert "replaceTrack" in code
+    assert "getUserMedia" not in code, "the getUserMedia override is back; Meet will crash a few seconds after joining"
 
 
 def test_the_page_never_opens_a_socket_of_its_own():

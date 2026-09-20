@@ -118,6 +118,17 @@ def cmd_status(s: Settings) -> None:
 # --------------------------------------------------------------------------- local commands
 
 
+def cmd_login(s: Settings) -> None:
+    """Sign Roger's browser profile into an account, once, so it can join meetings that refuse guests."""
+    setup_logging(s)
+    from .meeting import BrowserMeeting, browser_available
+
+    if not browser_available():
+        fail("the browser participant needs Playwright: pip install 'roger-meeting-agent[browser]' && playwright install chromium")
+    print("A browser window will open. Sign in as the account Roger should join meetings as, then close the window.")
+    asyncio.run(BrowserMeeting.sign_in(s))
+
+
 def cmd_sessions(project_dir: str | None) -> None:
     project = Path(project_dir or Path.cwd()).expanduser().resolve()
     rows = list_all_sessions(project)
@@ -257,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("sessions", help="list Claude Code sessions you can attach as the deep brain")
     sp.add_argument("project_dir", nargs="?", help="project folder (default: current directory)")
 
+    sub.add_parser("login", help="sign Roger's browser into an account (needed when a meeting refuses guests)")
     sub.add_parser("doctor", help="check configuration, keys and tools")
     return p
 

@@ -3,8 +3,8 @@
  *
  * This runs before the meeting app's own scripts, in every frame. It does three things:
  *
- *   1. Hands the meeting app a microphone that is really us. `getUserMedia` is patched to return a
- *      MediaStream we write Roger's voice into, so the call hears an ordinary participant.
+ *   1. Puts Roger's voice on the call. Every audio track the page installs on an RTCRtpSender is
+ *      swapped for one we write into, so the meeting hears an ordinary participant.
  *   2. Taps every inbound audio track by wrapping `RTCPeerConnection`, mixes them for transcription and
  *      keeps each one separately so we can tell who is talking.
  *   3. Carries that audio to and from Python.
@@ -38,7 +38,7 @@
   // Inbound runs at Roger's wire rate, because `createMediaStreamSource` resamples into its context for
   // free and in better quality than we would manage by hand. Capture therefore arrives ready to send.
   const bridge = {
-    outCtx: null, inCtx: null, mic: null, micNode: null, mixer: null,
+    outCtx: null, inCtx: null, mic: null, micNode: null, mixer: null, video: null,
     tracks: new Map(), nextStreamId: 1, ready: false, sent: 0, recv: 0,
   };
   window.__rogerBridge = bridge;
@@ -90,8 +90,12 @@
     return out;
   };
 
-  // A tap: hand every FRAME samples that pass through to Python. A ScriptProcessorNode is only pulled
-  // if its output leads somewhere, so each one ends at a silent gain node into the destination.
+  // A tap: hand every FRAME samples that pass through to Python.
+  //
+  // A ScriptProcessorNode is only pulled if its output leads somewhere, and the obvious somewhere --
+  // `ctx.destination` -- is the machine's speakers. Roger has no speakers to play to, and on a headless
+  // browser there is no output device at all. Each tap therefore ends in a MediaStreamAudioDestinationNode,
+  // which pulls the graph exactly the same way and touches no hardware. Nothing is ever played out loud.
   function tap(ctx, onFrame) {
     const node = ctx.createScriptProcessor(IN_BUFFER, 1, 1);
     let buf = new Float32Array(FRAME), n = 0;
@@ -102,10 +106,7 @@
         if (n === FRAME) { onFrame(buf); buf = new Float32Array(FRAME); n = 0; }
       }
     };
-    const silent = ctx.createGain();
-    silent.gain.value = 0;
-    node.connect(silent);
-    silent.connect(ctx.destination);
+    node.connect(ctx.createMediaStreamDestination());
     return node;
   }
 
@@ -144,9 +145,35 @@
     bridge.mixer = inCtx.createGain();
     bridge.mixer.connect(tap(inCtx, (f32) => sendAudio(0, f32)));
 
-    for (const c of [outCtx, inCtx]) if (c.state === "suspended") c.resume().catch(() => {});
     bridge.outCtx = outCtx;
     bridge.inCtx = inCtx;
+
+    // Keep both contexts running, and keep checking.
+    //
+    // A suspended AudioContext renders nothing, so its taps never fire and Roger is simply deaf -- with
+    // no error, in a page that otherwise looks joined. It has been seen suspended on arrival even with
+    // the autoplay policy relaxed, and the browser may suspend it again later. Resuming once at startup
+    // is therefore not enough: this keeps at it, and tells Python what the state is so `roger status`
+    // can show it rather than leaving a silent bot to be discovered in the meeting.
+    let reported = "";
+    bridge.wake = () => {
+        for (const c of [outCtx, inCtx]) {
+            if (c.state === "suspended") c.resume().catch(() => {});
+        }
+        const now = outCtx.state + "/" + inCtx.state;
+        if (now !== reported) {
+            reported = now;
+            log("audio contexts:", now);
+            send({ type: "audio_state", out: outCtx.state, in: inCtx.state });
+        }
+    };
+    bridge.wake();
+    setInterval(bridge.wake, 2000);
+    // A real gesture lifts the autoplay restriction when nothing else will.
+    for (const ev of ["click", "keydown", "pointerdown"]) {
+        window.addEventListener(ev, bridge.wake, { capture: true, passive: true });
+    }
+
     log("audio up: out", outCtx.sampleRate, "Hz, in", inCtx.sampleRate, "Hz, frame", FRAME);
     send({ type: "audio_format", out_rate: outCtx.sampleRate, in_rate: inCtx.sampleRate, frame: FRAME });
     return bridge;
@@ -163,6 +190,7 @@
   async function attachRemote(track, label) {
     if (bridge.tracks.has(track.id)) return;
     await audio();
+    if (bridge.wake) bridge.wake();   // someone is talking now; the context must not be asleep
     const ctx = bridge.inCtx;
     const stream = new MediaStream([track]);
     const sink = new Audio();
@@ -194,11 +222,14 @@
   }
 
   // ------------------------------------------------------------------ the fake devices
-  const FAKE_MIC = { deviceId: "roger-mic", groupId: "roger", kind: "audioinput", label: CFG.bot_name + " (virtual microphone)" };
-
-  // A still frame with the bot's name, so the tile in the call is not a void.
+  // A still frame with the bot's name, so the tile in the call is not a void. Built once and reused:
+  // a meeting app asks for the camera repeatedly, and a fresh canvas with its own repaint timer and
+  // capture stream each time leaks all three.
   function fakeVideo() {
-    const c = document.createElement("canvas"); c.width = 640; c.height = 360;
+    if (bridge.video) return bridge.video;
+    const c = document.createElement("canvas");
+    c.width = 640;
+    c.height = 360;
     const g = c.getContext("2d");
     const paint = () => {
       g.fillStyle = "#16181d"; g.fillRect(0, 0, c.width, c.height);
@@ -206,33 +237,70 @@
       g.textAlign = "center"; g.textBaseline = "middle";
       g.fillText(CFG.bot_name, c.width / 2, c.height / 2);
     };
-    paint(); setInterval(paint, 1000);  // keep the capture stream alive
-    return c.captureStream(2);
-  }
-
-  async function fakeStream(constraints) {
-    await audio();
-    const out = new MediaStream();
-    if (constraints && constraints.audio) bridge.mic.getAudioTracks().forEach((t) => out.addTrack(t));
-    if (constraints && constraints.video) fakeVideo().getVideoTracks().forEach((t) => out.addTrack(t));
-    return out;
-  }
-
-  const md = navigator.mediaDevices;
-  if (md) {
-    const realEnumerate = md.enumerateDevices && md.enumerateDevices.bind(md);
-    md.getUserMedia = async (c) => fakeStream(c || { audio: true });
-    md.enumerateDevices = async () => {
-      let real = [];
-      try { real = realEnumerate ? await realEnumerate() : []; } catch (_) {}
-      return [FAKE_MIC, ...real.filter((d) => d.kind !== "audioinput")];
-    };
-    if (navigator.getUserMedia) navigator.getUserMedia = (c, ok, err) => fakeStream(c).then(ok, err);
+    paint();
+    setInterval(paint, 1000);  // one timer for the life of the page: captureStream needs new frames
+    bridge.video = c.captureStream(2);
+    return bridge.video;
   }
 
   // ------------------------------------------------------------------ tapping the call
+  //
+  // Roger's voice is substituted at the *sender*, not at `getUserMedia`.
+  //
+  // Patching getUserMedia is the obvious way and it does not survive contact with Google Meet. Meet
+  // manages its microphone properly: it enumerates devices, reads getSettings(), and calls
+  // applyConstraints({deviceId: {exact: ...}}) to pin the one it wants. A MediaStreamAudioDestinationNode
+  // track is not a device and cannot answer any of that, and a few seconds later the renderer dies --
+  // no exception, no console message, just "Page crashed". Bisected: with the getUserMedia patch removed
+  // and everything else kept, the page is stable indefinitely.
+  //
+  // So Chrome's own fake device answers Meet's device questions, and the only thing we change is what
+  // actually leaves on the wire. Every audio track a page installs on a sender is swapped for ours, which
+  // also survives Meet replacing the track itself on mute and unmute.
+  async function swapSender(sender) {
+    if (!sender || sender.__roger) return;
+    await audio();
+    const mine = bridge.mic && bridge.mic.getAudioTracks()[0];
+    if (!mine) return;
+    sender.__roger = true;
+    try {
+      await ORIG_REPLACE.call(sender, mine);
+      log("sender now carries Roger's voice");
+    } catch (e) {
+      sender.__roger = false;
+      log("replaceTrack failed", e);
+    }
+  }
+
+  const ORIG_REPLACE = window.RTCRtpSender && RTCRtpSender.prototype.replaceTrack;
+  if (ORIG_REPLACE) {
+    RTCRtpSender.prototype.replaceTrack = function (track) {
+      if (track && track.kind === "audio") {
+        const mine = bridge.mic && bridge.mic.getAudioTracks()[0];
+        if (mine) { this.__roger = true; return ORIG_REPLACE.call(this, mine); }
+        swapSender(this);
+        return ORIG_REPLACE.call(this, track);
+      }
+      return ORIG_REPLACE.call(this, track);
+    };
+  }
+
   const OrigPC = window.RTCPeerConnection;
   if (OrigPC) {
+    const OrigAddTrack = OrigPC.prototype.addTrack;
+    const OrigAddTransceiver = OrigPC.prototype.addTransceiver;
+    OrigPC.prototype.addTrack = function (track, ...rest) {
+      const sender = OrigAddTrack.call(this, track, ...rest);
+      if (track && track.kind === "audio") swapSender(sender).catch(() => {});
+      return sender;
+    };
+    OrigPC.prototype.addTransceiver = function (kind, ...rest) {
+      const tr = OrigAddTransceiver.call(this, kind, ...rest);
+      const isAudio = kind === "audio" || (kind && kind.kind === "audio");
+      if (isAudio && tr && tr.sender) swapSender(tr.sender).catch(() => {});
+      return tr;
+    };
+
     window.RTCPeerConnection = new Proxy(OrigPC, {
       construct(target, args) {
         const pc = new target(...args);
@@ -285,8 +353,8 @@
     try { fn(m); return true; } catch (e) { log("command " + m.type + " failed", e); return false; }
   };
 
-  // Only the top frame talks to Python; sub-frames still get the patched getUserMedia above, which is
-  // all they are here for. The binding may land a tick after this script, so wait for it rather than
+  // Only the top frame talks to Python; sub-frames still get the patched RTCPeerConnection above, which
+  // is all they are here for. The binding may land a tick after this script, so wait for it rather than
   // assuming -- a missed hello would mean a bot that hears nothing and never says why.
   if (window.top === window) {
     let tries = 0;

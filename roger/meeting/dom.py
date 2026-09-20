@@ -28,18 +28,43 @@ async def first_visible(page: Any, selectors: Sequence[str], timeout_ms: int = S
 
 
 async def click_any(page: Any, selectors: Sequence[str], timeout_ms: int = SHORT_MS, what: str = "") -> bool:
-    """Click the first visible candidate. Returns whether anything was clicked."""
+    """Click the first visible candidate. Returns whether anything was clicked.
+
+    A meeting page will happily drop a coach-mark over the button you need -- Google Meet puts a "Got it"
+    bubble on top of "Ask to join" -- and a normal click then fails on actionability, not on the element
+    being absent. So a blocked click falls back to a forced one and finally to dispatching the event
+    directly, which no overlay can intercept.
+    """
     loc = await first_visible(page, selectors, timeout_ms)
     if loc is None:
         return False
-    try:
-        await loc.click(timeout=timeout_ms * 2)
-        if what:
-            log.debug("clicked %s", what)
-        return True
-    except Exception as e:
-        log.debug("clicking %s failed: %s", what or selectors[0], e)
-        return False
+    for attempt, click in enumerate((
+        lambda: loc.click(timeout=max(2000, timeout_ms)),
+        lambda: loc.click(timeout=2000, force=True),
+        lambda: loc.evaluate("el => el.click()"),
+    )):
+        try:
+            await click()
+            log.debug("clicked %s%s", what or selectors[0], "" if attempt == 0 else f" (fallback {attempt})")
+            return True
+        except Exception as e:
+            last = e
+    log.debug("could not click %s: %s", what or selectors[0], last)
+    return False
+
+
+async def dismiss_all(page: Any, selectors: Sequence[str], rounds: int = 2) -> int:
+    """Clear away banners and coach-marks. They appear on their own schedule, so this runs more than once."""
+    cleared = 0
+    for _ in range(rounds):
+        hit = False
+        for sel in selectors:
+            if await click_any(page, [sel], timeout_ms=400, what=sel):
+                cleared += 1
+                hit = True
+        if not hit:
+            break
+    return cleared
 
 
 async def fill_any(page: Any, selectors: Sequence[str], text: str, timeout_ms: int = SHORT_MS) -> bool:
