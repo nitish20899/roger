@@ -21,10 +21,8 @@ input becomes an even 100 ms cadence out, and the cushion is what absorbs the bu
 Silence is not transmitted. Only whole frames leave, at an even 100 ms cadence, because GPT-Live's deltas
 are arbitrary sizes and forwarding them raw gives the far end a lumpy, stuttering stream.
 
-Where the audio goes is not this module's business. It hands each frame to :attr:`Speaker.sink`, which
-the meeting client sets -- the browser participant pushes it into the call's microphone, a hosted service
-would wrap it in whatever that service wants. Frames also go to any monitor page open at ``/monitor``,
-which is how you listen to the bot without joining a meeting.
+Audio goes to the Attendee audio WebSocket as ``realtime_audio.bot_output`` frames, and to any monitor
+page open at ``/monitor``, which is how you listen to the bot without joining a meeting.
 """
 from __future__ import annotations
 
@@ -35,7 +33,7 @@ import logging
 import math
 import time
 from collections import deque
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 from aiohttp import web
 
@@ -54,8 +52,7 @@ FRAME_S = 0.1
 class Speaker:
     def __init__(self, s: Settings) -> None:
         self.s = s
-        # Set by the meeting client: one frame of 16-bit mono PCM at ``self.rate``, into the call.
-        self.sink: Optional[Callable[[bytes], Awaitable[None]]] = None
+        self.bot_ws: Optional[web.WebSocketResponse] = None
         self.monitors: set[web.WebSocketResponse] = set()
         self.queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.speaking = False
@@ -82,12 +79,12 @@ class Speaker:
             self._runner = asyncio.create_task(self._run())
 
     # ---- output plumbing
-    async def _send_all(self, pcm: Optional[bytes], monitor_frame: str) -> None:
-        if pcm and self.sink is not None:
+    async def _send_all(self, bot_frame: Optional[str], monitor_frame: str) -> None:
+        if bot_frame and self.bot_ws is not None and not self.bot_ws.closed:
             try:
-                await self.sink(pcm)
+                await self.bot_ws.send_str(bot_frame)
             except Exception as e:
-                log.warning("meeting audio sink failed: %s", e)
+                log.warning("bot ws send failed: %s", e)
         for ws in list(self.monitors):
             try:
                 await ws.send_str(monitor_frame)
@@ -95,14 +92,16 @@ class Speaker:
                 self.monitors.discard(ws)
 
     async def _send_pcm(self, chunk: bytes) -> None:
-        mon = json.dumps({"type": "audio", "pcm": base64.b64encode(chunk).decode()})
+        b64 = base64.b64encode(chunk).decode()
+        bot = json.dumps({"trigger": "realtime_audio.bot_output", "data": {"chunk": b64, "sample_rate": self.rate}})
+        mon = json.dumps({"type": "audio", "pcm": b64})
         now = time.time()
         if self._play_head < now:
             self._play_head = now
         ahead = self._play_head - now
         if ahead > self.lead_s:
             await asyncio.sleep(ahead - self.lead_s)  # hold the pace: never run further ahead than the cushion
-        await self._send_all(chunk, mon)
+        await self._send_all(bot, mon)
         self._play_head += len(chunk) / (self.rate * 2)
         self.bytes_out += len(chunk)
 

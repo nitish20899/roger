@@ -1,10 +1,9 @@
 """The orchestrator: meeting audio into GPT-Live, delegated questions out to the backends, voice back.
 
 GPT-Live owns hearing, speaking, turn-taking and -- through Responses delegation -- the reasoning too.
-The meeting itself is behind :mod:`roger.meeting`, which is why nothing here mentions Google Meet, Teams
-or a browser. What is left is everything neither of them can know:
+What is left here is everything it cannot know by itself:
 
-  * which human is talking (per-participant audio energy), so the transcript has names;
+  * which human is talking (from Attendee's per-participant audio energy), so the transcript has names;
   * what the project is: a briefing read from your Claude Code and Codex sessions;
   * running the tools its backend asks for, against the repository and the meeting chat;
   * the one rule a prompt cannot be trusted with: holding, when someone says "hold on, Roger".
@@ -16,12 +15,12 @@ import logging
 import time
 from typing import Optional
 
-from .audio import resample, rms
+from .attendee import Attendee
+from .audio import PARTICIPANT_RATE, resample, rms
 from .config import Settings
 from .context import attached_sessions, build_briefing
 from .live import LiveSession
 from .manners import Manners
-from .meeting import Event, MeetingClient, Participant, State, create_client
 from .prompts import NO_BRIEFING, arrival_note, backend_instructions, greeting_instruction, live_instructions
 from .speaker import Speaker
 from .tools import Toolbox, tool_definitions
@@ -36,15 +35,14 @@ class Bridge:
     def __init__(self, s: Settings) -> None:
         self.s = s
         self.speaker = Speaker(s)
-        self.meeting: MeetingClient = create_client(s)
-        self.speaker.sink = self.meeting.send_audio  # the bot's voice goes wherever the meeting is
+        self.attendee = Attendee(s)
         self.transcript = Transcript()
         self.briefing = NO_BRIEFING
         self.sessions: list = []
         self.greeted = False
         self.bot_state: Optional[str] = None
         self.manners = Manners(s.wake_words)
-        self.tools = Toolbox(s.project_dir, self.meeting.send_chat)
+        self.tools = Toolbox(s.project_dir, self.attendee.chat)
         self.live = LiveSession(
             s,
             on_output_audio=self.speaker.feed,
@@ -56,15 +54,11 @@ class Bridge:
             backend=self._backend_config,
         )
         # speaker attribution from per-participant audio energy
-        self.energy: dict[str, list[tuple[float, float]]] = {}  # participant id -> [(time, rms)]
+        self.energy: dict[str, list[tuple[float, float]]] = {}  # participant uuid -> [(time, rms)]
         self.names: dict[str, str] = {}
+        self.names_refreshed = 0.0
         self.mixed_seen = False
         self.suppressed_frames = 0
-
-        self.meeting.on(Event.AUDIO, self.on_audio)
-        self.meeting.on(Event.PARTICIPANT_AUDIO, self.on_participant_audio)
-        self.meeting.on(Event.PARTICIPANT, self.on_participant)
-        self.meeting.on(Event.STATE, self.on_meeting_state)
 
     def _backend_config(self) -> dict:
         """The Responses backend GPT-Live delegates to: model, prompt and tools."""
@@ -93,13 +87,12 @@ class Bridge:
         self.s.state_dir.mkdir(parents=True, exist_ok=True)
         self.speaker.start()
         self.greeted = True  # only greet after a fresh join(), never after a restart
-        adopt = getattr(self.meeting, "adopt_existing", None)
-        if adopt is not None:  # a hosted participant may still be in a call from before the restart
-            try:
-                if await adopt():
-                    asyncio.create_task(self._poll_meeting_state())
-            except Exception as e:
-                log.warning("could not adopt an existing participant: %s", e)
+        try:
+            await self.attendee.adopt_existing()
+            if self.attendee.bot_id:
+                asyncio.create_task(self._watch_state())
+        except Exception as e:
+            log.warning("attendee: adopt failed: %s", e)
         # The briefing seeds the live session and the backend prompt, so read it before opening the session.
         try:
             self.sessions = attached_sessions(self.s)
@@ -110,7 +103,7 @@ class Bridge:
 
     async def close(self) -> None:
         await self.live.close()
-        await self.meeting.close()
+        await self.attendee.close()
 
     # ------------------------------------------------------------------ audio in
     def _suppressed(self) -> bool:
@@ -121,39 +114,37 @@ class Bridge:
         """
         return self.s.echo_suppress and self.speaker.echo_window()
 
-    async def on_audio(self, pcm: bytes, rate: int = 0, from_mixed: bool = True) -> None:
-        """Everyone in the room, mixed. This is what GPT-Live listens to."""
+    async def on_audio(self, pcm: bytes, from_mixed: bool = True) -> None:
+        """Mixed meeting audio from the Attendee WebSocket."""
         if from_mixed:
             self.mixed_seen = True
         if self._suppressed():
             self.suppressed_frames += 1
             return
-        if rate and rate != self.s.sample_rate:
-            pcm = resample(pcm, rate, self.s.sample_rate)
         await self.live.feed(pcm)
 
-    async def on_participant_audio(self, participant_id: str, pcm: bytes, rate: int = 0) -> None:
-        """One person's audio: speaker attribution, and the transcription source if there is no mix."""
-        lst = self.energy.setdefault(participant_id, [])
-        lst.append((time.time(), rms(pcm)))
+    async def on_participant_audio(self, uuid: str, pcm: bytes) -> None:
+        """One participant's audio: speaker attribution, and the transcription source if there is no mixed stream."""
+        now = time.time()
+        lst = self.energy.setdefault(uuid, [])
+        lst.append((now, rms(pcm)))
         if len(lst) > 400:
             del lst[: len(lst) - 400]
+        if uuid not in self.names and now - self.names_refreshed > 5:
+            asyncio.create_task(self.refresh_names())
         if not self.mixed_seen:
-            # Fallback only, and it needs the rate: a hosted participant caps these streams below the
-            # session's rate, and feeding them through unconverted pitches everyone in the room.
-            await self.on_audio(pcm, rate or self.s.sample_rate, from_mixed=False)
+            # Fallback only: Attendee will not send per-participant streams above 16 kHz, so they have to be
+            # brought up to the session's rate or the bot would hear everyone at the wrong pitch.
+            await self.on_audio(resample(pcm, min(self.s.sample_rate, PARTICIPANT_RATE), self.s.sample_rate), from_mixed=False)
 
-    async def on_participant(self, p: Participant, joined: bool) -> None:
-        """Someone was identified. Names come from the meeting layer, whichever provider found them."""
-        self.names[p.id] = p.name
-        log.info("participant %s: %s", "joined" if joined else "seen", p.name)
-
-    async def on_meeting_state(self, state: State) -> None:
-        self.bot_state = state.value
-        if state is State.WAITING_ROOM:
-            log.info('>>> waiting to be admitted: please let "%s" in from the meeting', self.s.bot_name)
-        elif state is State.JOINED:
-            asyncio.create_task(self.greet())
+    async def refresh_names(self) -> None:
+        self.names_refreshed = time.time()
+        try:
+            found = await self.attendee.participants()
+            if found:
+                self.names.update(found)
+        except Exception as e:
+            log.debug("participants: %s", e)
 
     def who_spoke(self, approx_duration_s: float) -> str:
         """Which participant's stream carried the most energy over the utterance just transcribed."""
@@ -228,36 +219,36 @@ class Bridge:
 
     # ------------------------------------------------------------------ bot lifecycle
     async def join(self, meeting_url: str) -> str:
-        """Send the participant into a call. State arrives as events, not a return value."""
+        if not self.s.public_url:
+            raise RuntimeError("no public URL: start with a Cloudflare quick tunnel (cloudflared installed) or set PUBLIC_URL")
         self.greeted = False
-        await self.meeting.join(meeting_url)
-        if hasattr(self.meeting, "poll_state"):
-            asyncio.create_task(self._poll_meeting_state())
-        return getattr(self.meeting, "bot_id", None) or self.meeting.name
+        bot_id = await self.attendee.create_bot(meeting_url, self.s.public_url)
+        asyncio.create_task(self._watch_state())
+        return bot_id
 
-    async def _poll_meeting_state(self) -> None:
-        """For a provider with no state of its own to push (the hosted one), ask it every few seconds."""
+    async def _watch_state(self) -> None:
+        last = None
         for _ in range(1440):  # about two hours at 5 s
             try:
-                st = await self.meeting.poll_state()
+                st = await self.attendee.state()
             except Exception as e:
-                log.debug("state poll: %s", e)
-                st = None
-            if st is not None:
-                await self.meeting._set_state(st)
-                if st.final:
+                st = f"poll error: {e}"
+            if st != last:
+                log.info("bot state: %s", st)
+                last = st
+                self.bot_state = st
+                if st == "waiting_room":
+                    log.info(">>> the bot is in the waiting room: please admit \"%s\" from the meeting", self.s.bot_name)
+                if st in ("ended", "fatal_error", "data_deleted"):
                     return
             await asyncio.sleep(5)
 
-    async def leave(self) -> None:
-        await self.meeting.leave()
-
     def health(self) -> dict:
-        meeting = self.meeting.health() if hasattr(self.meeting, "health") else {"provider": self.meeting.name}
         return {
             "public_url": self.s.public_url,
-            "meeting": meeting,
+            "bot_id": self.attendee.bot_id,
             "bot_state": self.bot_state,
+            "bot_audio_ws": bool(self.speaker.bot_ws and not self.speaker.bot_ws.closed),
             "live": {
                 "connected": self.live.ready.is_set(),
                 "session_id": self.live.session_id,

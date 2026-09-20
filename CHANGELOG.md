@@ -1,39 +1,5 @@
 # Changelog
 
-## 0.5.0 - 2026-09-20
-
-**Roger joins meetings by itself. One key, one service.**
-
-- **No meeting-bot service.** Roger opens the call in a Chromium it drives on this machine and walks in
-  like a person. `ATTENDEE_API_KEY` is no longer required, and neither is a public URL, a tunnel or
-  `cloudflared` -- the audio socket is `127.0.0.1`. OpenAI is the only key and the only bill.
-- **New `roger/meeting/` package**, and it is the point of the release. Everything above it talks to a
-  `MeetingClient` -- join, leave, send_audio, send_chat -- and subscribes to an event bus, so nothing
-  outside it knows what a Google Meet is:
-  - `browser.py` drives Chromium; `assets/bridge.js` is injected into the meeting page, patches
-    `getUserMedia` to hand out a microphone fed by Roger's voice, and taps every inbound WebRTC track.
-  - `platforms/google_meet.py` and `platforms/teams.py` are *only* selectors and a join flow. Adding a
-    platform is one class; adding a consumer (a recorder, a note-taker) is `meeting.on(Event.AUDIO, fn)`.
-  - `attendee.py` still exists behind the same interface as an opt-in fallback: `MEETING_PROVIDER=attendee`.
-- **Three things the meeting products simply do not allow**, each found the hard way and each pinned by
-  a test:
-  - A page script cannot open a WebSocket to `127.0.0.1` inside Google Meet: the CSP forbids it and the
-    attempt crashes the renderer outright. Audio crosses on a Playwright binding (DevTools protocol)
-    instead, which no page policy can touch.
-  - An AudioWorklet cannot be installed inside Teams: its CSP refuses `blob:` and `data:` module URLs.
-    The taps are `ScriptProcessorNode`s -- deprecated, and the only thing that works in both products.
-  - Chrome hands WebRTC a silent track from an AudioContext that is not at the browser's native rate.
-- **Fixed a bug that made Roger mute in every meeting.** Chrome hands WebRTC a *silent* track from a
-  `MediaStreamAudioDestinationNode` whose AudioContext is not at the browser's native sample rate --
-  correctly formed, completely empty, no error anywhere. The outbound context now runs at the browser's
-  rate and the inbound one at 24 kHz. `tests/test_browser_audio.py` pins it with a real WebRTC loopback
-  in a real browser, and CI runs it.
-- **`speaker.py` no longer knows where audio goes.** It writes to a sink the meeting client owns, which
-  is what let the browser and hosted participants share every line above them.
-- Settings: added `MEETING_PROVIDER`, `BROWSER_HEADLESS`, `BROWSER_DEBUG`; removed the unused
-  `ATTENDEE_USE_LOGIN` and `ATTENDEE_LOGIN_GROUP`. `PUBLIC_URL` is now only read by the hosted provider.
-- Zoom is no longer claimed. It was only ever the hosted provider's, and Roger does not drive it yet.
-
 ## 0.4.0 - 2026-09-20
 
 **A clean-out. Two services, no dead weight.**

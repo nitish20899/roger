@@ -1,7 +1,7 @@
 """PCM helpers. Everything in Roger is 16-bit mono little-endian; the rate is a setting.
 
-24 kHz is the default because GPT-Live generates it natively and the meeting page captures at it, so a
-sample crosses the whole path -- ears, model, voice, back into the call -- without being converted once.
+24 kHz is the default because it is what GPT-Live generates natively and what Attendee asks for when the
+audio comes from an OpenAI realtime model, so the samples cross the whole path without being converted once.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import struct
 
 SAMPLE_RATE = 24000  # default; Settings.sample_rate is what actually runs
 FRAME_MS = 100
-PARTICIPANT_RATE = 16000  # a hosted participant caps per-speaker streams here; they only feed the energy meter
+PARTICIPANT_RATE = 16000  # Attendee caps per-participant streams here; they only feed the energy meter
 
 
 def chunk_bytes(rate: int, ms: int = FRAME_MS) -> int:
@@ -44,10 +44,8 @@ def tone(seconds: float = 1.0, hz: float = 440.0, amplitude: int = 8000, rate: i
 def resample(pcm: bytes, src_hz: int, dst_hz: int) -> bytes:
     """Linear resample of PCM16.
 
-    Only the per-participant fallback needs this, and only for a hosted participant, which will not send
-    those streams above 16 kHz. The browser participant captures at the session's rate already: its page
-    resamples on the way in, where the browser does it properly and for free. So this runs on a stream
-    nobody listens to directly, and linear interpolation is good enough for speech.
+    Only the per-participant fallback needs this -- Attendee will not send those streams above 16 kHz -- so
+    it runs on a stream nobody listens to directly, and linear interpolation is good enough for speech.
     """
     if src_hz == dst_hz or not pcm:
         return pcm

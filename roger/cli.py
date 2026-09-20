@@ -46,9 +46,7 @@ def fail(msg: str, code: int = 2) -> None:
 
 def cmd_serve(s: Settings, meeting_url: str | None, leave_on_exit: bool) -> None:
     problems = s.problems()
-    # Without a meeting to join, anything about getting into one is a warning, not a stopper: the monitor
-    # page and `roger ask` are worth having on their own.
-    soft = {"ATTENDEE_API_KEY", "cloudflared", "PUBLIC_URL"}
+    soft = {"ATTENDEE_API_KEY", "cloudflared"}
     hard = [p for p in problems if not (not meeting_url and any(k in p for k in soft))]
     for p in problems:
         if p not in hard:
@@ -64,8 +62,8 @@ def cmd_serve(s: Settings, meeting_url: str | None, leave_on_exit: bool) -> None
     from .server import public_url, serve
 
     s.public_url = public_url(s)
-    if s.hosted_participant and not s.public_url:
-        log.warning("no public URL: the hosted participant cannot reach this machine, so it cannot join a meeting")
+    if not s.public_url:
+        log.warning("no public URL: the bot cannot join meetings from this run, but the monitor page and `roger ask` work")
     asyncio.run(serve(s, meeting_url=meeting_url, leave_on_exit=leave_on_exit))
 
 
@@ -131,41 +129,21 @@ def cmd_sessions(project_dir: str | None) -> None:
     print("or put CLAUDE_SESSION_ID / CODEX_SESSION_ID and PROJECT_DIR in .env. Sessions are read for context, never run.")
 
 
-def _chromium_installed() -> bool:
-    """Has `playwright install chromium` been run? It downloads into a well-known cache."""
-    import glob
-
-    roots = [Path.home() / "Library/Caches/ms-playwright", Path.home() / ".cache/ms-playwright"]
-    return any(glob.glob(str(r / "chromium*")) for r in roots if r.exists())
-
-
 def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
     ok, bad = "ok ", "!! "
     lines: list[tuple[str, str, str]] = []
 
     lines.append((ok if env_files else bad, ".env", ", ".join(map(str, env_files)) if env_files else "not found: copy .env.example to .env in this directory (or to ~/.roger/.env) and fill in your keys"))
+    hosted = "app.attendee.dev" in s.attendee_base
+    lines.append((ok if s.attendee_api_key else bad, "Attendee key", "set" if s.attendee_api_key else "missing (https://app.attendee.dev)"))
+    lines.append((ok, "Attendee", s.attendee_base + ("" if hosted else "  (self-hosted)")))
     lines.append((ok if s.openai_api_key else bad, "OpenAI key", "set" if s.openai_api_key else "missing (https://platform.openai.com/api-keys): GPT-Live needs it to hear and speak"))
-
-    from .meeting import browser_available, supported_platforms
-
-    if s.hosted_participant:
-        hosted = "app.attendee.dev" in s.attendee_base
-        lines.append((ok, "Participant", "attendee (hosted service)"))
-        lines.append((ok if s.attendee_api_key else bad, "Attendee key", "set" if s.attendee_api_key else "missing (https://app.attendee.dev)"))
-        lines.append((ok, "Attendee", s.attendee_base + ("" if hosted else "  (self-hosted)")))
-    else:
-        have = browser_available()
-        lines.append((ok, "Participant", "browser on this machine" + ("" if s.browser_headless else " (visible)")))
-        lines.append((ok if have else bad, "Playwright", "installed" if have else "missing: pip install 'roger-meeting-agent[browser]' && playwright install chromium"))
-        if have:
-            lines.append((ok if _chromium_installed() else bad, "Chromium", "installed" if _chromium_installed() else "not downloaded yet: playwright install chromium"))
-        lines.append((ok, "Platforms", supported_platforms()))
     voice_ok = s.voice in LIVE_VOICES or s.voice.startswith("voice_")
     lines.append((ok if voice_ok else bad, "Voice", f"{s.live_model} / {s.voice}" + ("" if voice_ok else f"  (unknown voice; try one of: {', '.join(LIVE_VOICES[:8])} ...)")))
     lines.append((ok, "Backend model", s.fast_model))
     if s.public_url:
         lines.append((ok, "Public URL", s.public_url))
-    elif s.hosted_participant:
+    else:
         cf = shutil.which("cloudflared")
         lines.append((ok if cf else bad, "Tunnel", f"cloudflared at {cf}" if cf else "cloudflared not found: brew install cloudflared, or set PUBLIC_URL"))
     from .context import attached_sessions
