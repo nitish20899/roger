@@ -1,13 +1,23 @@
-"""HTTP and WebSocket server: the Attendee bot connects here, the orb and monitor pages are served from here."""
+"""The local server, and the public URL that reaches it.
+
+The Attendee bot connects here over a WebSocket: meeting audio in, the bot's voice out. A small monitor
+page at ``/monitor`` plays that voice locally, which is how you hear the bot without joining a call.
+
+Attendee has to reach this machine, so unless ``PUBLIC_URL`` is set a Cloudflare quick tunnel is started
+in front of it. That needs ``cloudflared`` on PATH and no Cloudflare account.
+"""
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
-import hashlib
 import json
 import logging
+import re
+import shutil
 import signal
-from pathlib import Path
+import subprocess
+import time
 
 from aiohttp import WSMsgType, web
 
@@ -17,44 +27,54 @@ from .config import STATIC_DIR, Settings
 
 log = logging.getLogger("roger.server")
 
-ORB_DIR = STATIC_DIR / "orb"  # built ElevenLabs UI orb (see orb/ at the repo root); falls back to the shader page
+TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
 
-def orb_page(s: Settings) -> tuple[str, str]:
-    """``(html, version)``. The version changes whenever the page or its settings change, and connected pages reload."""
-    built = ORB_DIR / "index.html"
-    if built.exists():
-        html = built.read_text()
-        assets = "".join(sorted(p.name for p in (ORB_DIR / "assets").glob("*")))
-        digest = hashlib.md5((html + assets + s.orb_colors + s.orb_bg + str(s.orb_size)).encode()).hexdigest()[:10]
-        inject = f'<script>window.ORB_VERSION="{digest}";window.ORB_COLORS="{s.orb_colors}";window.ORB_BG="{s.orb_bg}";window.ORB_SIZE="{s.orb_size}";</script>'
-        return html.replace("</head>", inject + "</head>", 1), digest
-    html = (STATIC_DIR / "orb-fallback.html").read_text()
-    digest = hashlib.md5(html.encode()).hexdigest()[:10]
-    return html.replace("__BOT_FIRST_NAME__", s.bot_first_name).replace("__BOT_NAME__", s.bot_name).replace("__ORB_VERSION__", digest), digest
+def start_tunnel(port: int, timeout: float = 25.0) -> tuple[str, subprocess.Popen]:
+    """A free public HTTPS URL in front of ``localhost:port``. Returns ``(url, process)``."""
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        line = proc.stderr.readline()
+        if not line:
+            if proc.poll() is not None:
+                break
+            continue
+        found = TUNNEL_RE.search(line)
+        if found:
+            return found.group(0), proc
+    proc.terminate()
+    raise RuntimeError("cloudflared did not report a URL; run `cloudflared tunnel --url http://localhost:%d` by hand, or set PUBLIC_URL" % port)
 
 
-def orb_kind() -> str:
-    return "elevenlabs-ui" if (ORB_DIR / "index.html").exists() else "shader"
+def public_url(s: Settings) -> str | None:
+    """The URL Attendee will dial back on: yours if set, otherwise a quick tunnel."""
+    if s.public_url:
+        return s.public_url
+    if not shutil.which("cloudflared"):
+        return None
+    log.info("starting a Cloudflare quick tunnel ...")
+    url, proc = start_tunnel(s.port)
+    atexit.register(lambda: proc.terminate())
+    log.info("tunnel: %s", url)
+    return url
 
 
 def build_app(bridge: Bridge, s: Settings) -> web.Application:
-    orb_html, orb_version = orb_page(s)
     monitor_html = (STATIC_DIR / "monitor.html").read_text().replace("__BOT_NAME__", s.bot_name)
-
-    async def h_orb(_: web.Request) -> web.Response:
-        return web.Response(text=orb_html, content_type="text/html", headers={"Cache-Control": "no-store"})
 
     async def h_monitor(_: web.Request) -> web.Response:
         return web.Response(text=monitor_html, content_type="text/html")
 
     async def h_ws_monitor(request: web.Request) -> web.WebSocketResponse:
-        """Orb and monitor pages: they receive audio and state, and may send the meeting audio they capture."""
+        """The monitor page: it receives the bot's audio and its listening/speaking state."""
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
         bridge.speaker.monitors.add(ws)
         await ws.send_str(json.dumps({"type": "state", "state": "listening"}))
-        await ws.send_str(json.dumps({"type": "orb_version", "v": orb_version}))
         try:
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
@@ -66,10 +86,8 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
                     m = json.loads(msg.data)
                 except json.JSONDecodeError:
                     continue
-                if m.get("type") == "mic" and m.get("pcm"):
-                    await bridge.on_page_mic(base64.b64decode(m["pcm"]))
-                elif m.get("type") == "hello":
-                    log.info("orb: page connected (%s, webgl=%s, version=%s, ua=%s)", m.get("orb", "shader"), m.get("webgl"), m.get("version"), str(m.get("ua", ""))[:60])
+                if m.get("type") == "hello":
+                    log.info("monitor page connected")
         finally:
             bridge.speaker.monitors.discard(ws)
         return ws
@@ -82,6 +100,15 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
         log.info("attendee: audio websocket connected")
         asyncio.create_task(bridge.greet())
         frames = 0
+        seen: set[str] = set()  # one line per stream: they start at different times
+
+        def first(trigger: str, rate) -> None:
+            if trigger not in seen:
+                seen.add(trigger)
+                log.info("attendee: receiving %s audio (sample_rate=%s)", trigger, rate)
+                if trigger == "mixed" and rate and int(rate) != s.sample_rate:
+                    log.warning("attendee: mixed audio is %s Hz but the live session is %s Hz; set AUDIO_RATE=%s to match", rate, s.sample_rate, rate)
+
         try:
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
@@ -95,13 +122,11 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
                 chunk = data.get("chunk")
                 if trig == "realtime_audio.mixed" and chunk:
                     frames += 1
-                    if frames == 1:
-                        log.info("attendee: receiving mixed audio (sample_rate=%s)", data.get("sample_rate"))
+                    first("mixed", data.get("sample_rate"))
                     await bridge.on_audio(base64.b64decode(chunk))
                 elif trig == "realtime_audio.per_participant" and chunk:
                     frames += 1
-                    if frames == 1:
-                        log.info("attendee: receiving per-participant audio (sample_rate=%s)", data.get("sample_rate"))
+                    first("per-participant", data.get("sample_rate"))
                     await bridge.on_participant_audio(str(data.get("participant_uuid")), base64.b64decode(chunk))
                 else:
                     log.debug("attendee event %s", trig)
@@ -128,27 +153,29 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
 
     async def h_say(request: web.Request) -> web.Response:
         body = await request.json()
-        bridge.speaker.say(str(body.get("text", "")))
+        text = str(body.get("text", "")).strip()
+        if not text:
+            return web.json_response({"error": "text required"}, status=400)
+        await bridge.speak_exactly(text)
         return web.json_response({"ok": True})
 
     async def h_ask(request: web.Request) -> web.Response:
         """Simulate a heard utterance without a meeting: {"speaker": "Alice", "text": "Roger, ..."}"""
         body = await request.json()
-        await bridge.on_committed(str(body.get("text", "")), str(body.get("speaker", "Tester")))
+        text = str(body.get("text", "")).strip()
+        if not text:
+            return web.json_response({"error": "text required"}, status=400)
+        await bridge.inject_utterance(str(body.get("speaker", "Tester")), text)
         return web.json_response({"ok": True})
 
     async def h_tone(_: web.Request) -> web.Response:
         """One second of a 440 Hz tone: verifies the audio path without any API keys."""
-        bridge.speaker.play_pcm("tone", tone(1.0))
+        bridge.speaker.play_pcm("tone", tone(1.0, rate=s.sample_rate))
         return web.json_response({"ok": True})
 
-    async def h_decisions(_: web.Request) -> web.Response:
-        return web.json_response(bridge.attention.decisions[-50:])
 
     async def h_health(_: web.Request) -> web.Response:
-        h = bridge.health()
-        h["orb"] = orb_kind() if s.orb else "off"
-        return web.json_response(h)
+        return web.json_response(bridge.health())
 
     async def h_index(_: web.Request) -> web.Response:
         raise web.HTTPFound("/monitor")
@@ -157,7 +184,6 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
     routes = [
         web.get("/", h_index),
         web.get("/monitor", h_monitor),
-        web.get("/orb", h_orb),
         web.get("/ws/monitor", h_ws_monitor),
         web.get("/ws/attendee", h_ws_attendee),
         web.post("/join", h_join),
@@ -166,10 +192,7 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
         web.post("/ask", h_ask),
         web.get("/test/tone", h_tone),
         web.get("/health", h_health),
-        web.get("/decisions", h_decisions),
     ]
-    if ORB_DIR.exists():
-        routes.append(web.static("/orb/", str(ORB_DIR)))
     app.add_routes(routes)
     return app
 
@@ -193,7 +216,7 @@ async def serve(s: Settings, meeting_url: str | None = None, leave_on_exit: bool
 
     try:
         await bridge.start()
-        log.info("ready: local http://localhost:%d/monitor  public %s  orb=%s", s.port, s.public_url or "(none)", orb_kind() if s.orb else "off")
+        log.info("ready: local http://localhost:%d/monitor  public %s", s.port, s.public_url or "(none)")
         log.info("config: %s", json.dumps(s.summary()))
         if meeting_url:
             bot_id = await bridge.join(meeting_url)

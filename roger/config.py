@@ -1,7 +1,7 @@
 """Configuration. Everything comes from environment variables, normally through a ``.env`` file.
 
 ``.env.example`` at the repository root documents every variable. Only three keys are required:
-``ATTENDEE_API_KEY``, ``ELEVENLABS_API_KEY`` and one of ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY``.
+``ATTENDEE_API_KEY`` and ``OPENAI_API_KEY``. Those are the only two services Roger talks to.
 """
 from __future__ import annotations
 
@@ -22,8 +22,13 @@ MISHEARINGS: dict[str, list[str]] = {
     "claude": ["cloud", "claud", "clawed", "clod"],
 }
 
-FAST_MODEL_DEFAULTS = {"openai": "gpt-4.1-mini", "anthropic": "claude-haiku-4-5"}
-CLASSIFIER_MODEL_DEFAULTS = {"openai": "gpt-4.1-mini", "anthropic": "claude-haiku-4-5"}
+LIVE_MODEL = "gpt-live-1"
+# Built-in GPT-Live voices (https://developers.openai.com/api/docs/guides/live-conversations#voice-options).
+# Masculine-sounding ones, roughly: cedar, ash, verse, echo, ballad, stone, cinder, meridian.
+LIVE_VOICES = [
+    "alloy", "ash", "ballad", "beacon", "bossa", "cedar", "cinder", "coral", "delta", "echo", "gleam",
+    "marin", "meridian", "quartz", "ripple", "sage", "shimmer", "stone", "tempo", "verse", "vesper", "willow",
+]
 
 
 def load_env(path: str | None = None) -> list[Path]:
@@ -66,46 +71,39 @@ class Settings:
     attendee_use_login: bool = False  # join Teams / Meet with a signed-in bot account configured in Attendee
     attendee_login_group: str | None = None
 
-    # voice (ElevenLabs)
-    elevenlabs_api_key: str | None = None
-    voice_id: str = "JBFqnCBsd6RMkjVDRZzb"  # "George", a stock voice
-    tts_model: str = "eleven_flash_v2_5"
-    stt_model: str = "scribe_v2_realtime"
-    stt_silence_s: float = 0.6
-    voice_stability: float = 0.6
-    voice_style: float = 0.0
+    # voice and hearing (OpenAI GPT-Live: one full-duplex session does both)
+    live_model: str = LIVE_MODEL
+    voice: str = "cedar"  # GPT-Live's male flagship voice; "marin" is its female counterpart
     language: str = "en"
+    sample_rate: int = 24000  # GPT-Live's native rate, and what Attendee wants for an OpenAI voice
+    # Measured delivery from GPT-Live stalls for up to ~360 ms now and then. The cushion has to be longer
+    # than the longest stall or the far end runs dry mid-word, which is heard as distortion rather than a gap.
+    output_buffer_ms: int = 500
+    echo_suppress: bool = False  # drop incoming audio while the bot speaks, if it ever hears itself
 
-    # brains
-    fast_provider: str = "openai"  # "openai" or "anthropic": who answers on the voice path
+    # the delegated backend
     openai_api_key: str | None = None
-    anthropic_api_key: str | None = None
-    fast_model: str = "gpt-4.1-mini"
-    classifier_model: str = "gpt-4.1-mini"
+    fast_model: str = "gpt-5.6-luna"
 
     # persona
     bot_name: str = "Roger"
     bot_first_name: str = "Roger"
     owner_name: str | None = None
     wake_words: list[str] = field(default_factory=lambda: ["roger", "rodger", "rojer"])
-    attention_window_s: float = 30.0
     greeting: str | None = None
 
-    # audio and visuals
-    per_participant_audio: bool = True
-    orb: bool = True
-    audio_out: str = "page"  # "page": the orb page plays the voice; "ws": realtime_audio.bot_output frames
-    orb_colors: str = "#FFC7A1,#DF5B37"
-    orb_bg: str = "#0a0d10"
-    orb_size: int = 520
-    barge_in_energy: bool = False
+    per_participant_audio: bool = True  # per-speaker streams, so the transcript has names
 
-    # deep brain (Claude Code through the Agent SDK)
-    deep_enabled: bool = False
+    # web search on the delegated backend
+    web_search: bool = True
+
+    # session context: Claude Code and Codex sessions are READ for context, never run
     claude_session_id: str | None = None
+    codex_session_id: str | None = None
+    repo_tools: bool = True  # let the backend search and read the project's files
+    briefing_model: str = "gpt-5.6-luna"
+    backend_effort: str = "none"  # reasoning effort for the delegated backend; latency matters here
     project_dir: str = field(default_factory=lambda: str(Path.cwd()))
-    deep_model: str = "sonnet"  # an alias resolves correctly on Anthropic and on gateways (Bedrock, Vertex, Databricks)
-    deep_auth: str = "subscription"  # or "api": bill ANTHROPIC_API_KEY instead of the Claude Code login
 
     # ------------------------------------------------------------------ construction
     @classmethod
@@ -120,23 +118,15 @@ class Settings:
         s.attendee_use_login = flag("ATTENDEE_USE_LOGIN", False)
         s.attendee_login_group = env("ATTENDEE_LOGIN_GROUP")
 
-        s.elevenlabs_api_key = env("ELEVENLABS_API_KEY")
-        s.voice_id = env("ELEVENLABS_VOICE_ID", s.voice_id)
-        s.tts_model = env("ELEVENLABS_TTS_MODEL", s.tts_model)
-        s.stt_model = env("ELEVENLABS_STT_MODEL", s.stt_model)
-        s.stt_silence_s = float(env("STT_SILENCE_S", str(s.stt_silence_s)))
-        s.voice_stability = float(env("VOICE_STABILITY", str(s.voice_stability)))
-        s.voice_style = float(env("VOICE_STYLE", str(s.voice_style)))
+        s.live_model = env("LIVE_MODEL", s.live_model)
+        s.sample_rate = int(env("AUDIO_RATE", str(s.sample_rate)))
+        s.output_buffer_ms = int(env("OUTPUT_BUFFER_MS", str(s.output_buffer_ms)))
+        s.voice = (env("VOICE", s.voice) or s.voice).strip()
         s.language = env("LANGUAGE", s.language)
+        s.echo_suppress = flag("ECHO_SUPPRESS", False)
 
         s.openai_api_key = env("OPENAI_API_KEY")
-        s.anthropic_api_key = env("ANTHROPIC_API_KEY")
-        provider = env("FAST_PROVIDER")
-        if provider not in ("openai", "anthropic"):
-            provider = "openai" if s.openai_api_key or not s.anthropic_api_key else "anthropic"
-        s.fast_provider = provider
-        s.fast_model = env("FAST_MODEL", FAST_MODEL_DEFAULTS[provider])
-        s.classifier_model = env("CLASSIFIER_MODEL", CLASSIFIER_MODEL_DEFAULTS[provider])
+        s.fast_model = env("FAST_MODEL", s.fast_model)
 
         s.bot_name = env("BOT_NAME", s.bot_name).strip()
         s.bot_first_name = env("BOT_FIRST_NAME", s.bot_name.split()[0] if s.bot_name.split() else "Roger").strip()
@@ -144,38 +134,36 @@ class Settings:
         first = s.bot_first_name.lower()
         default_wake = ",".join([first] + MISHEARINGS.get(first, []))
         s.wake_words = [w.strip().lower() for w in env("WAKE_WORDS", default_wake).split(",") if w.strip()]
-        s.attention_window_s = float(env("ATTENTION_WINDOW_S", str(s.attention_window_s)))
         s.greeting = env("GREETING")
 
         s.per_participant_audio = flag("PER_PARTICIPANT_AUDIO", True)
-        s.orb = flag("ORB", True)
-        s.audio_out = env("AUDIO_OUT", "page" if s.orb else "ws")
-        if not s.orb:
-            s.audio_out = "ws"  # without the page there is nothing else to play the voice
-        s.orb_colors = env("ORB_COLORS", s.orb_colors)
-        s.orb_bg = env("ORB_BG", s.orb_bg)
-        s.orb_size = int(env("ORB_SIZE", str(s.orb_size)))
-        s.barge_in_energy = flag("BARGE_IN_ENERGY", False)
+
+        s.web_search = flag("WEB_SEARCH", True)
+        s.repo_tools = flag("REPO_TOOLS", True)
+        s.briefing_model = env("BRIEFING_MODEL", s.briefing_model)
+        s.backend_effort = (env("BACKEND_EFFORT", s.backend_effort) or s.backend_effort).strip().lower()
 
         s.claude_session_id = env("CLAUDE_SESSION_ID")
+        s.codex_session_id = env("CODEX_SESSION_ID")
         s.project_dir = str(Path(env("PROJECT_DIR", s.project_dir)).expanduser())
-        deep = (env("DEEP_AGENT", "auto") or "auto").lower()
-        s.deep_enabled = bool(s.claude_session_id or env("PROJECT_DIR")) if deep == "auto" else deep in ("1", "true", "yes", "on")
-        s.deep_model = env("DEEP_MODEL", s.deep_model)
-        s.deep_auth = env("DEEP_AUTH", "api" if s.anthropic_api_key and not s.claude_session_id else "subscription")
         return s
 
-    def attach_session(self, session_id: str | None = None, project_dir: str | None = None) -> None:
-        """Turn the deep brain on for a Claude Code session and/or project folder (command-line overrides)."""
+    def attach_session(self, session_id: str | None = None, project_dir: str | None = None, engine: str = "claude") -> None:
+        """Attach a coding-agent session as context, and/or point at a project folder (command-line overrides)."""
         if project_dir:
             self.project_dir = str(Path(project_dir).expanduser().resolve())
         if session_id:
-            self.claude_session_id = session_id
-        self.deep_enabled = True
-        if not os.getenv("DEEP_AUTH"):
-            self.deep_auth = "subscription"
+            if engine == "codex":
+                self.codex_session_id = session_id
+            else:
+                self.claude_session_id = session_id
 
     # ------------------------------------------------------------------ derived
+    @property
+    def chunk_bytes(self) -> int:
+        """One 100 ms frame of 16-bit mono audio at the configured rate."""
+        return int(self.sample_rate * 2 * 0.1)
+
     @property
     def owner_possessive(self) -> str:
         """``"Alice's"`` or ``"the team's"``."""
@@ -186,16 +174,16 @@ class Settings:
         out: list[str] = []
         if not self.attendee_api_key:
             out.append("ATTENDEE_API_KEY is missing (sign up at https://app.attendee.dev, then Settings > API keys)")
-        if not self.elevenlabs_api_key:
-            out.append("ELEVENLABS_API_KEY is missing (https://elevenlabs.io > profile > API keys)")
-        if self.fast_provider == "openai" and not self.openai_api_key:
-            out.append("FAST_PROVIDER is openai but OPENAI_API_KEY is missing")
-        if self.fast_provider == "anthropic" and not self.anthropic_api_key:
-            out.append("FAST_PROVIDER is anthropic but ANTHROPIC_API_KEY is missing")
+        if not self.openai_api_key:
+            out.append("OPENAI_API_KEY is missing: GPT-Live is both the ears and the voice (https://platform.openai.com/api-keys)")
+        if self.voice not in LIVE_VOICES and not self.voice.startswith("voice_"):
+            out.append(f"VOICE is {self.voice!r}, which is not a GPT-Live voice. Pick one of: {', '.join(LIVE_VOICES)}")
+        if self.sample_rate not in (8000, 16000, 24000):
+            out.append(f"AUDIO_RATE must be 8000, 16000 or 24000, not {self.sample_rate} (GPT-Live accepts 16000 or 24000)")
+        elif self.sample_rate == 8000:
+            out.append("AUDIO_RATE 8000 is accepted by Attendee but not by GPT-Live over a WebSocket; use 16000 or 24000")
         if not self.public_url and not shutil.which("cloudflared"):
             out.append("cloudflared is not installed and PUBLIC_URL is empty: install cloudflared (brew install cloudflared) or set PUBLIC_URL to a public https URL that reaches this machine")
-        if self.audio_out not in ("page", "ws"):
-            out.append(f"AUDIO_OUT must be 'page' or 'ws', not {self.audio_out!r}")
         return out
 
     def summary(self) -> dict:
@@ -203,21 +191,13 @@ class Settings:
         return {
             "bot_name": self.bot_name,
             "wake_words": self.wake_words,
-            "fast_provider": self.fast_provider,
             "fast_model": self.fast_model,
-            "classifier_model": self.classifier_model,
-            "voice_id": self.voice_id,
-            "tts_model": self.tts_model,
-            "stt_model": self.stt_model,
-            "deep_agent": self.deep_enabled,
-            "deep_model": self.deep_model if self.deep_enabled else None,
+            "live_model": self.live_model,
+            "voice": self.voice,
+            "sample_rate": self.sample_rate,
             "claude_session": (self.claude_session_id or "")[:8] or None,
-            "audio_out": self.audio_out,
-            "orb": self.orb,
-            "keys": {
-                "attendee": bool(self.attendee_api_key),
-                "elevenlabs": bool(self.elevenlabs_api_key),
-                "openai": bool(self.openai_api_key),
-                "anthropic": bool(self.anthropic_api_key),
-            },
+            "codex_session": (self.codex_session_id or "")[:8] or None,
+            "repo_tools": self.repo_tools,
+            "web_search": self.web_search,
+            "keys": {"attendee": bool(self.attendee_api_key), "openai": bool(self.openai_api_key)},
         }

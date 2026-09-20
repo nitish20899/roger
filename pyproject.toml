@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roger-meeting-agent"
-version = "0.1.1"
+version = "0.4.0"
 description = "Roger: a voice AI teammate that joins your Google Meet, Microsoft Teams and Zoom calls, listens, talks back and posts to chat."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
-keywords = ["meeting", "bot", "voice", "agent", "elevenlabs", "google-meet", "teams", "zoom", "claude", "openai"]
+keywords = ["meeting", "bot", "voice", "agent", "gpt-live", "realtime", "google-meet", "teams", "zoom", "openai"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
@@ -18,6 +18,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Communications :: Conferencing",
   "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
@@ -27,8 +28,6 @@ dependencies = [
   "websockets>=13",
   "python-dotenv>=1.0",
   "openai>=1.50",
-  "anthropic>=0.40",
-  "claude-agent-sdk>=0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -45,7 +44,7 @@ Issues = "https://github.com/nitish20899/roger/issues"
 include = ["roger*"]
 
 [tool.setuptools.package-data]
-roger = ["static/*.html", "static/orb/*", "static/orb/assets/*"]
+roger = ["static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

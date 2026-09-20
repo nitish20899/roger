@@ -1,7 +1,7 @@
 """Client for the Attendee meeting-bot API (https://docs.attendee.dev).
 
 Attendee runs the actual meeting participant (a browser in their cloud). We ask it to join a URL, it streams
-the meeting audio to our WebSocket, renders our orb page as the bot's webcam, and posts chat messages.
+the meeting audio to our WebSocket, plays the bot's voice back into the call, and posts chat messages.
 """
 from __future__ import annotations
 
@@ -11,9 +11,8 @@ from typing import Any, Optional
 
 import httpx
 
-from .audio import SAMPLE_RATE
+from .audio import PARTICIPANT_RATE
 from .config import Settings
-from .prompts import intro_chat_line
 
 log = logging.getLogger("roger.attendee")
 
@@ -33,31 +32,18 @@ class Attendee:
         if not self.s.attendee_api_key:
             raise RuntimeError("ATTENDEE_API_KEY missing")
         ws_url = public_url.replace("https://", "wss://").replace("http://", "ws://")
-        ws_settings: dict[str, Any] = {"audio": {"url": f"{ws_url}/ws/attendee", "sample_rate": SAMPLE_RATE}}
+        ws_settings: dict[str, Any] = {"audio": {"url": f"{ws_url}/ws/attendee", "sample_rate": self.s.sample_rate}}
         if self.s.per_participant_audio:
-            ws_settings["per_participant_audio"] = {"url": f"{ws_url}/ws/attendee", "sample_rate": SAMPLE_RATE}
+            # Attendee caps these streams at 16 kHz. They only drive the energy meter that puts names on the
+            # transcript, so the rate does not have to match the session's.
+            ws_settings["per_participant_audio"] = {"url": f"{ws_url}/ws/attendee", "sample_rate": min(self.s.sample_rate, PARTICIPANT_RATE)}
         body: dict[str, Any] = {
             "meeting_url": meeting_url,
             "bot_name": self.s.bot_name,
             "websocket_settings": ws_settings,
-            "bot_chat_message": {"to": "everyone", "message": intro_chat_line(self.s)},
             "metadata": {"app": "roger"},
         }
-        if self.s.orb:
-            mute = "&mute=1" if self.s.audio_out == "ws" else ""
-            body["voice_agent_settings"] = {"url": f"{public_url}/orb?mic=1{mute}"}
-        if self.s.attendee_use_login:
-            # Signed-in bot accounts (Attendee dashboard: Settings > Bot Logins) for tenants that block guests.
-            key = "teams_settings" if "teams.microsoft.com" in meeting_url else "google_meet_settings" if "meet.google.com" in meeting_url else None
-            if key:
-                body[key] = {"use_login": True, **({"login_group_name": self.s.attendee_login_group} if self.s.attendee_login_group else {})}
-
         r = await self.http.post(f"{self.s.attendee_base}/bots", json=body)
-        if r.status_code >= 300 and "voice_agent_settings" in body:
-            log.warning("create with voice_agent_settings failed %s: %s; retrying without the orb (voice over the websocket instead)", r.status_code, r.text[:200])
-            body.pop("voice_agent_settings")
-            self.s.audio_out = "ws"  # nothing will render the page, so the voice must go over the audio websocket
-            r = await self.http.post(f"{self.s.attendee_base}/bots", json=body)
         if r.status_code >= 300 and self.s.per_participant_audio:
             log.warning("create with per-participant audio failed %s: %s; retrying with mixed audio only", r.status_code, r.text[:200])
             body["websocket_settings"].pop("per_participant_audio", None)

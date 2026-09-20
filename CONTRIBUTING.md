@@ -13,19 +13,14 @@ make test             # offline tests, no keys needed
 ## Ground rules
 
 - **Never commit secrets.** `.env` is ignored; keep it that way. Use `.env.example` for new variables, with a comment.
-- **Keep the voice path fast.** Anything added between a committed transcript and the first spoken sentence needs a reason and a measurement (`latency:` lines in the log).
-- **Attention logic gets a test.** Changes to `attention.py` come with a case in `tests/test_attention.py`; prompt changes should keep `scripts/eval_attention.py` at or above 23/24 (add cases if you found a new failure mode).
-- **Prompts live in `prompts.py`.** No prompt text elsewhere.
+- **Keep the voice path fast.** Anything added between hearing a question and the first spoken word needs a reason and a measurement. The log records delegation and tool timings.
+- **Measure audio changes, do not guess.** `roger/speaker.py` is a jitter buffer with real constants behind it (GPT-Live delivery stalls up to ~360 ms). If you change one, say what you measured.
+- **Prompts live in `prompts.py`.** No prompt text anywhere else.
+- **Read-only stays read-only.** The tools in `roger/tools.py` may search and read under `PROJECT_DIR` and nothing more. No tool edits files, runs commands or pushes.
 - **Settings come from the environment.** New knobs go through `Settings.from_env()` and are documented in `.env.example` and the README table if they matter to users.
 
-## Working on the orb
-
-```bash
-cd orb && npm ci && npm run dev      # Vite dev server; the page expects a Roger server on :8787
-make orb                             # rebuild into roger/static/orb (commit the output)
-```
 
 ## Pull requests
 
-One change per PR, a short description of what you tried in a meeting (or with `roger ask` / `scripts/loop_test.py`),
+One change per PR, a short description of what you tried in a meeting (or with `roger ask`),
 and `make test` green.

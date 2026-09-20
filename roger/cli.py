@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import atexit
 import json
 import logging
 import logging.handlers
@@ -14,9 +13,8 @@ from pathlib import Path
 import httpx
 
 from . import __version__
-from .config import STATIC_DIR, Settings, load_env
-from .elevenlabs import BILLING_URL, fetch_quota
-from .sessions import find_session, list_sessions, sessions_dir
+from .config import LIVE_VOICES, Settings, load_env
+from .sessions import find_session, list_all_sessions, list_sessions, sessions_dir
 
 
 def setup_logging(s: Settings) -> None:
@@ -61,19 +59,11 @@ def cmd_serve(s: Settings, meeting_url: str | None, leave_on_exit: bool) -> None
 
     setup_logging(s)
     log = logging.getLogger("roger")
-    if not s.public_url and shutil.which("cloudflared"):
-        from .tunnel import start_tunnel, stop_tunnel
+    from .server import public_url, serve
 
-        log.info("starting a Cloudflare quick tunnel ...")
-        url, proc = start_tunnel(s.port)
-        atexit.register(stop_tunnel, proc)
-        s.public_url = url
-        log.info("tunnel: %s", url)
-    elif not s.public_url:
+    s.public_url = public_url(s)
+    if not s.public_url:
         log.warning("no public URL: the bot cannot join meetings from this run, but the monitor page and `roger ask` work")
-
-    from .server import serve
-
     asyncio.run(serve(s, meeting_url=meeting_url, leave_on_exit=leave_on_exit))
 
 
@@ -128,14 +118,15 @@ def cmd_status(s: Settings) -> None:
 
 def cmd_sessions(project_dir: str | None) -> None:
     project = Path(project_dir or Path.cwd()).expanduser().resolve()
-    rows = list_sessions(project)
+    rows = list_all_sessions(project)
     if not rows:
-        fail(f"no Claude Code sessions found for {project} (looked in {sessions_dir(project)})", code=1)
-    print(f"Claude Code sessions for {project} (newest first):\n")
+        fail(f"no Claude Code or Codex sessions found for {project} (looked in {sessions_dir(project)} and ~/.codex/sessions)", code=1)
+    print(f"Coding sessions for {project} (newest first):\n")
     for r in rows:
         name = f"[{r.title}]  " if r.title else ""
-        print(f"{r.id}  {r.size_mb:6.1f} MB  {r.age_h:7.1f} h ago  {r.lines:6d} lines  {name}{r.first_message}")
-    print("\nUse one with `roger run <url> --session <id or title> --project <that path>`, or put CLAUDE_SESSION_ID and PROJECT_DIR in .env.")
+        print(f"{r.engine:6}  {r.id}  {r.size_mb:6.1f} MB  {r.age_h:7.1f} h ago  {r.lines:6d} lines  {name}{r.first_message}")
+    print("\nAttach one with `roger run <url> --session <id or title>` (add --engine codex for a Codex one),")
+    print("or put CLAUDE_SESSION_ID / CODEX_SESSION_ID and PROJECT_DIR in .env. Sessions are read for context, never run.")
 
 
 def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
@@ -143,34 +134,33 @@ def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
     lines: list[tuple[str, str, str]] = []
 
     lines.append((ok if env_files else bad, ".env", ", ".join(map(str, env_files)) if env_files else "not found: copy .env.example to .env in this directory (or to ~/.roger/.env) and fill in your keys"))
+    hosted = "app.attendee.dev" in s.attendee_base
     lines.append((ok if s.attendee_api_key else bad, "Attendee key", "set" if s.attendee_api_key else "missing (https://app.attendee.dev)"))
-    lines.append((ok if s.elevenlabs_api_key else bad, "ElevenLabs key", "set" if s.elevenlabs_api_key else "missing (https://elevenlabs.io)"))
-    if s.elevenlabs_api_key:
-        try:
-            q = fetch_quota(s.elevenlabs_api_key)
-            lines.append((bad if q.low else ok, "ElevenLabs credits", q.describe() + (f". Too few for a meeting: add credits at {BILLING_URL}" if q.low else "")))
-        except Exception as e:
-            lines.append((bad, "ElevenLabs credits", f"could not check ({str(e)[:80]}); is the key valid?"))
-    fast_key = s.openai_api_key if s.fast_provider == "openai" else s.anthropic_api_key
-    lines.append((ok if fast_key else bad, "Fast responder", f"{s.fast_provider} / {s.fast_model}" + ("" if fast_key else f"  ({s.fast_provider.upper()}_API_KEY missing)")))
-    lines.append((ok, "Classifier", f"{s.fast_provider} / {s.classifier_model}"))
-    lines.append((ok, "Voice", f"{s.voice_id} / {s.tts_model}; hearing with {s.stt_model}"))
+    lines.append((ok, "Attendee", s.attendee_base + ("" if hosted else "  (self-hosted)")))
+    lines.append((ok if s.openai_api_key else bad, "OpenAI key", "set" if s.openai_api_key else "missing (https://platform.openai.com/api-keys): GPT-Live needs it to hear and speak"))
+    voice_ok = s.voice in LIVE_VOICES or s.voice.startswith("voice_")
+    lines.append((ok if voice_ok else bad, "Voice", f"{s.live_model} / {s.voice}" + ("" if voice_ok else f"  (unknown voice; try one of: {', '.join(LIVE_VOICES[:8])} ...)")))
+    lines.append((ok, "Backend model", s.fast_model))
     if s.public_url:
         lines.append((ok, "Public URL", s.public_url))
     else:
         cf = shutil.which("cloudflared")
         lines.append((ok if cf else bad, "Tunnel", f"cloudflared at {cf}" if cf else "cloudflared not found: brew install cloudflared, or set PUBLIC_URL"))
-    orb_built = (STATIC_DIR / "orb" / "index.html").exists()
-    lines.append((ok, "Orb page", ("ElevenLabs UI orb (built)" if orb_built else "fallback shader orb (run `make orb` for the ElevenLabs one)") if s.orb else "disabled (ORB=0)"))
-    if s.deep_enabled:
-        if s.claude_session_id:
-            f = sessions_dir(s.project_dir) / f"{s.claude_session_id}.jsonl"
-            lines.append((ok if f.exists() else bad, "Deep brain", f"Claude Code session {s.claude_session_id[:8]} in {s.project_dir}" + ("" if f.exists() else f"  (session file not found: {f})")))
-        else:
-            lines.append((ok, "Deep brain", f"fresh Claude Code session in {s.project_dir}"))
-        lines.append((ok, "Deep auth", "claude.ai login (DEEP_AUTH=subscription)" if s.deep_auth == "subscription" else "ANTHROPIC_API_KEY (DEEP_AUTH=api)"))
+    from .context import attached_sessions
+
+    found = attached_sessions(s)
+    if s.claude_session_id or s.codex_session_id:
+        for r in found:
+            lines.append((ok, f"{r.engine.capitalize()} session", f"{r.id[:8]}  [{r.label[:50]}]  {r.lines} lines, {r.age_h:.1f} h old"))
+        for engine, wanted in (("claude", s.claude_session_id), ("codex", s.codex_session_id)):
+            if wanted and not any(r.engine == engine for r in found):
+                lines.append((bad, f"{engine.capitalize()} session", f"{wanted!r} not found for {s.project_dir}; run `roger sessions`"))
     else:
-        lines.append((ok, "Deep brain", "off (set CLAUDE_SESSION_ID or PROJECT_DIR to enable)"))
+        lines.append((ok, "Sessions", "none attached; the briefing will come from the repository alone"))
+    lines.append((ok, "Repo tools", f"search and read under {s.project_dir}" if s.repo_tools else "off (REPO_TOOLS=0)"))
+    lines.append((ok, "Web search", "on" if s.web_search else "off (WEB_SEARCH=0)"))
+    lines.append((ok, "Briefing model", s.briefing_model))
+    lines.append((ok, "Audio", f"{s.sample_rate} Hz, {s.output_buffer_ms} ms buffer" + (", echo suppression on" if s.echo_suppress else "")))
     lines.append((ok, "State dir", str(s.state_dir)))
     lines.append((ok, "Persona", f"{s.bot_name}; wake words: {', '.join(s.wake_words)}"))
 
@@ -184,25 +174,27 @@ def cmd_doctor(s: Settings, env_files: list[Path]) -> None:
     print("\nAll good. Try: roger run https://meet.google.com/xxx-xxxx-xxx")
 
 
-def apply_deep_flags(s: Settings, session: str | None, project: str | None) -> None:
-    """--session / --project on `run` and `serve`: attach a Claude Code session from the command line."""
+def apply_deep_flags(s: Settings, session: str | None, project: str | None, engine: str | None = None) -> None:
+    """--session / --project / --engine: attach a coding session as context from the command line."""
     if not session and not project:
         return
     project_dir = str(Path(project).expanduser().resolve()) if project else s.project_dir
+    found_engine = engine or "claude"
     if session == "latest":
-        rows = list_sessions(project_dir)
+        rows = list_sessions(project_dir, engine) if engine else list_all_sessions(project_dir)
         if not rows:
-            fail(f"no Claude Code sessions found for {project_dir} (looked in {sessions_dir(project_dir)}); pass --project <dir> or a session id")
-        session = rows[0].id
-        print(f"attaching the newest Claude Code session for {project_dir}: {session[:8]}  ({rows[0].age_h:.1f} h old: {rows[0].first_message[:60]})")
+            fail(f"no sessions found for {project_dir}; pass --project <dir> or a session id")
+        session, found_engine = rows[0].id, rows[0].engine
+        print(f"attaching the newest {found_engine} session for {project_dir}: {session[:8]}  ({rows[0].age_h:.1f} h old: {rows[0].label[:60]})")
     elif session:
-        found = find_session(project_dir, session)
+        found = find_session(project_dir, session, engine)
         if not found:
-            fail(f"no session matching {session!r} for {project_dir} (looked in {sessions_dir(project_dir)}); run `roger sessions <project-dir>` to see ids and titles")
+            fail(f"no session matching {session!r} for {project_dir}; run `roger sessions <project-dir>` to see ids and titles")
+        found_engine = found.engine
         if found.id != session:
-            print(f"attaching Claude Code session {found.id[:8]}  [{found.title or found.first_message[:60]}]")
+            print(f"attaching {found_engine} session {found.id[:8]}  [{found.label[:60]}]")
         session = found.id
-    s.attach_session(session, project)
+    s.attach_session(session, project, found_engine)
 
 
 # --------------------------------------------------------------------------- entry point
@@ -215,8 +207,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True, metavar="command")
 
     def deep_flags(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--session", metavar="ID", help="Claude Code session to attach as the deep brain: an id (or its first characters), a session title, or 'latest' for the newest one in the project (overrides CLAUDE_SESSION_ID)")
-        parser.add_argument("--project", metavar="DIR", help="project folder of that session, or any repo for a fresh read-only session (overrides PROJECT_DIR)")
+        parser.add_argument("--session", metavar="ID", help="a Claude Code or Codex session to read for context: an id (or its first characters), a title, or 'latest' for the newest in the project")
+        parser.add_argument("--project", metavar="DIR", help="the project folder: what the repo tools search (overrides PROJECT_DIR)")
+        parser.add_argument("--engine", choices=["claude", "codex"], help="which client the session belongs to (default: search both)")
 
     sp = sub.add_parser("run", help="start everything, send the bot into a meeting, leave when you press Ctrl-C")
     sp.add_argument("meeting_url", help="Google Meet, Microsoft Teams or Zoom link")
@@ -252,7 +245,7 @@ def main(argv: list[str] | None = None) -> None:
     s = Settings.from_env()
 
     if args.command in ("run", "serve"):
-        apply_deep_flags(s, args.session, args.project)
+        apply_deep_flags(s, args.session, args.project, args.engine)
     if args.command == "run":
         cmd_serve(s, args.meeting_url, leave_on_exit=True)
     elif args.command == "serve":

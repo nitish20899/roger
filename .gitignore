@@ -15,10 +15,6 @@ dist/
 venv/
 .pytest_cache/
 
-# orb (React) build inputs; the built page under roger/static/orb IS committed
-orb/node_modules/
-orb/dist/
-
 # editors and OS
 .DS_Store
 .idea/

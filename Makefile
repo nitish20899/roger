@@ -3,7 +3,7 @@ PY ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: setup dev run serve doctor test orb clean
+.PHONY: setup dev run serve doctor test lint clean
 
 setup: $(BIN)/roger .env   ## create a virtualenv, install Roger, create .env from the example
 	@echo "Now edit .env with your API keys, then: make doctor"
@@ -34,8 +34,8 @@ doctor: $(BIN)/roger   ## check keys and tools
 test: $(BIN)/roger     ## offline tests (no API keys needed)
 	$(BIN)/python -m pytest -q
 
-orb:                   ## rebuild the ElevenLabs orb page into roger/static/orb (needs Node 18+)
-	cd orb && npm ci && npm run build
+lint: $(BIN)/roger     ## unused imports and obvious mistakes
+	$(BIN)/python -m pyflakes roger/*.py tests/*.py
 
 clean:
-	rm -rf $(VENV) build dist *.egg-info roger/__pycache__ tests/__pycache__ .pytest_cache
+	rm -rf build dist *.egg-info roger/__pycache__ tests/__pycache__ .pytest_cache
