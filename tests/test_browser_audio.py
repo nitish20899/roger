@@ -58,27 +58,25 @@ def goertzel(pcm: bytes, hz: float, rate: int) -> float:
     return math.sqrt(max(0.0, s1 * s1 + s2 * s2 - coeff * s1 * s2)) / n
 
 
-async def _round_trip(tmp_path, port: int) -> dict:
+async def _round_trip(tmp_path, port: int = 8798) -> dict:
     from aiohttp import web
     from playwright.async_api import async_playwright
 
     from roger.meeting import BrowserMeeting
-    from roger.meeting.browser import CHROME_ARGS
+    from roger.meeting.browser import BINDING, CHROME_ARGS
 
     s = Settings()
     s.openai_api_key = "sk-test"
-    s.port = port
     s.browser_headless = True
     meeting = BrowserMeeting(s)
 
     captured = bytearray()
     meeting.on(Event.AUDIO, lambda pcm, rate: captured.extend(pcm))
 
+    # Served over http://127.0.0.1 rather than a data: URL: getUserMedia only exists in a secure context,
+    # and localhost counts as one. Nothing else is served -- the audio crosses on the binding.
     app = web.Application()
-    app.add_routes([
-        web.get("/ws/browser", meeting.handle_ws),
-        web.get("/p", lambda r: web.Response(text=PAGE, content_type="text/html")),
-    ])
+    app.add_routes([web.get("/p", lambda r: web.Response(text=PAGE, content_type="text/html"))])
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", port).start()
@@ -89,12 +87,14 @@ async def _round_trip(tmp_path, port: int) -> dict:
         permissions=["microphone", "camera"], ignore_default_args=["--enable-automation", "--mute-audio"],
     )
     try:
+        await ctx.expose_binding(BINDING, meeting._on_binding)
         await ctx.add_init_script(meeting._bridge_js())
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        meeting.page = page
         await page.goto(f"http://127.0.0.1:{port}/p", wait_until="load")
 
         for _ in range(100):
-            if meeting._ws is not None:
+            if meeting._linked:
                 break
             await asyncio.sleep(0.1)
         mic_tracks = await page.evaluate("window.ready")
@@ -115,6 +115,7 @@ async def _round_trip(tmp_path, port: int) -> dict:
         mid = len(heard) // 2
         window = heard[max(0, mid - 24000) : mid + 24000]   # while the tone was playing
         return {
+            "linked": meeting._linked,
             "mic_tracks": mic_tracks,
             "streams": len(meeting._streams),
             "rates": rates,
@@ -123,6 +124,7 @@ async def _round_trip(tmp_path, port: int) -> dict:
             "off_tone": goertzel(window, 1000.0, s.sample_rate),
         }
     finally:
+        meeting.page = None
         await ctx.close()
         await pw.stop()
         await runner.cleanup()
@@ -130,7 +132,12 @@ async def _round_trip(tmp_path, port: int) -> dict:
 
 @pytest.fixture(scope="module")
 def result(tmp_path_factory):
-    return asyncio.run(_round_trip(tmp_path_factory.mktemp("browser"), 8798))
+    return asyncio.run(_round_trip(tmp_path_factory.mktemp("browser")))
+
+
+def test_the_page_links_to_python_without_a_socket(result):
+    """The binding is the transport: a page WebSocket is blocked by Meet's CSP and crashes the renderer."""
+    assert result["linked"] is True
 
 
 def test_the_page_gets_rogers_microphone(result):

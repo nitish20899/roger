@@ -7,6 +7,7 @@ them -- which is the one place a silent mistake would cost a whole meeting.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import struct
 
@@ -196,9 +197,9 @@ def test_a_participant_is_announced_once_and_updated_on_change():
 # --------------------------------------------------------------------------- the page wire format
 
 
-def page_frame(stream_id: int, pcm: bytes) -> bytes:
-    """Exactly what bridge.js puts on the socket: a little-endian stream id, then PCM."""
-    return struct.pack("<I", stream_id) + pcm
+def page_frame(stream_id: int, pcm: bytes) -> str:
+    """Exactly what bridge.js hands the binding: one JSON message with base64 PCM."""
+    return json.dumps({"type": "audio", "stream": stream_id, "pcm": base64.b64encode(pcm).decode()})
 
 
 def test_stream_zero_is_the_mix_and_the_rest_are_people():
@@ -208,9 +209,9 @@ def test_stream_zero_is_the_mix_and_the_rest_are_people():
         m.on(Event.AUDIO, lambda pcm, rate: mixed.append((pcm, rate)))
         m.on(Event.PARTICIPANT_AUDIO, lambda who, pcm, rate: per.append((who, pcm, rate)))
 
-        await m._on_page_audio(page_frame(0, b"\x11\x22\x33\x44"))
+        await m._on_page_event(page_frame(0, b"\x11\x22\x33\x44"))
         await m._on_page_event(json.dumps({"type": "track", "stream_id": 7, "track_id": "track-abc"}))
-        await m._on_page_audio(page_frame(7, b"\x55\x66\x77\x88"))
+        await m._on_page_event(page_frame(7, b"\x55\x66\x77\x88"))
 
         assert mixed == [(b"\x11\x22\x33\x44", 24000)]
         assert per == [("track-abc", b"\x55\x66\x77\x88", 24000)]
@@ -224,18 +225,19 @@ def test_audio_from_an_unannounced_stream_still_counts():
         m = BrowserMeeting(settings())
         per = []
         m.on(Event.PARTICIPANT_AUDIO, lambda who, pcm, rate: per.append(who))
-        await m._on_page_audio(page_frame(3, b"\x00\x01\x02\x03"))
+        await m._on_page_event(page_frame(3, b"\x00\x01\x02\x03"))
         assert per == ["stream-3"]
 
     run(body())
 
 
-def test_a_runt_frame_is_ignored_rather_than_crashing():
+def test_an_empty_or_corrupt_frame_is_ignored_rather_than_crashing():
     async def body():
         m = BrowserMeeting(settings())
         seen = []
         m.on(Event.AUDIO, lambda *a: seen.append(a))
-        await m._on_page_audio(b"\x00\x00")
+        await m._on_page_event(json.dumps({"type": "audio", "stream": 0, "pcm": ""}))
+        await m._on_page_event(json.dumps({"type": "audio", "stream": 0, "pcm": "!!!not base64!!!"}))
         assert seen == []
 
     run(body())
@@ -275,19 +277,30 @@ def test_chat_from_the_page_becomes_an_event():
 
 
 def test_the_page_script_is_configured_not_hardcoded():
-    s = settings(port=9999, sample_rate=24000, bot_name="Roger")
+    s = settings(sample_rate=24000, bot_name="Roger")
     js = BrowserMeeting(s)._bridge_js()
     assert "__ROGER_CFG__" not in js, "the config placeholder was left unsubstituted"
-    assert "ws://127.0.0.1:9999/ws/browser" in js
     assert '"rate": 24000' in js
     assert "getUserMedia" in js and "RTCPeerConnection" in js
 
 
-def test_the_javascript_encoder_and_the_python_decoder_agree():
-    """Run bridge.js's own encoder under Node and parse the result the way BrowserMeeting does.
+def test_the_page_never_opens_a_socket_of_its_own():
+    """Google Meet's CSP forbids connecting to 127.0.0.1, and the attempt crashes the renderer.
 
-    This is the one seam where a silent disagreement -- endianness, header width, clipping -- would cost a
-    whole meeting and show up only as noise. Skipped when Node is not around.
+    Everything therefore crosses on the Playwright binding. A WebSocket reappearing in the page script
+    would look fine in tests and fail only inside a real meeting, so it is checked here.
+    """
+    js = BrowserMeeting(settings())._bridge_js()
+    code = "\n".join(ln for ln in js.splitlines() if not ln.strip().startswith("*"))
+    assert "new WebSocket" not in code
+    assert "__rogerSend" in code
+
+
+def test_the_javascript_encoder_and_the_python_decoder_agree():
+    """Run bridge.js's own encoder under Node and decode it the way BrowserMeeting does.
+
+    This is the one seam where a silent disagreement -- endianness, clipping, base64 -- would cost a whole
+    meeting and show up only as noise. Skipped when Node is not around.
     """
     import shutil as _shutil
     import subprocess
@@ -299,19 +312,23 @@ def test_the_javascript_encoder_and_the_python_decoder_agree():
     from roger.meeting.browser import ASSETS
 
     src = (ASSETS / "bridge.js").read_text()
-    encoder = src[src.index("const toPcm16 = ") + len("const toPcm16 = "):src.index(";\n  const fromPcm16")]
+
+    def lift(name: str, until: str) -> str:
+        head = "const " + name + " = "
+        return src[src.index(head) + len(head) : src.index(until)]
+
+    to_pcm16 = lift("toPcm16", ";\n  const fromPcm16")
+    to_b64 = lift("b64", ";\n  const unb64")
     script = (
-        f"const toPcm16 = ({encoder});"
+        "const toPcm16 = (" + to_pcm16 + ");"
+        "const b64 = (" + to_b64 + ");"
         "const f = new Float32Array([0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0]);"
-        "const {buf, view} = toPcm16(f); view.setUint32(0, 7, true);"
-        "process.stdout.write(Buffer.from(buf).toString('hex'));"
+        "process.stdout.write(b64(toPcm16(f)));"
     )
     out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
-    data = bytes.fromhex(out.stdout.strip())
 
-    assert struct.unpack_from("<I", data, 0)[0] == 7
-    pcm = data[4:]
+    pcm = base64.b64decode(out.stdout.strip())
     assert struct.unpack("<" + "h" * (len(pcm) // 2), pcm) == (0, 16383, -16384, 32767, -32768, 32767, -32768)
 
 
@@ -332,5 +349,6 @@ def test_both_providers_implement_the_whole_interface():
             assert callable(getattr(cls, method)), f"{cls.__name__}.{method}"
 
 
-def test_providers_declare_distinct_sockets():
-    assert BrowserMeeting.ws_path != AttendeeMeeting.ws_path
+def test_only_a_provider_that_is_dialled_into_mounts_a_route():
+    assert BrowserMeeting.ws_path is None       # nothing reaches in; the page is driven over CDP
+    assert AttendeeMeeting.ws_path == "/ws/attendee"

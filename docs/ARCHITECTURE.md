@@ -47,9 +47,21 @@ meeting/attendee.py       the hosted alternative, same interface, opt-in
 ```
 
 The browser participant works by injecting `bridge.js` before the meeting app's own scripts. It patches
-`getUserMedia` to hand out a microphone fed by an AudioWorklet — so when Roger speaks, the call hears an
-ordinary participant — and wraps `RTCPeerConnection` to tap every inbound audio track. One WebSocket back
-to `127.0.0.1` carries PCM both ways: `<uint32 stream id><pcm16le>`, where stream 0 is the mix.
+`getUserMedia` to hand out a microphone we write Roger's voice into — so the call hears an ordinary
+participant — and wraps `RTCPeerConnection` to tap every inbound audio track. Microsoft Teams lists it as
+*"Roger (virtual microphone)"* in its own device picker, which is the clearest sign it is working.
+
+Two decisions there were forced by what the meeting products allow, and both cost a day to find:
+
+**The transport is a Playwright binding, not a WebSocket.** Google Meet's Content-Security-Policy forbids
+a page script from connecting to `127.0.0.1`, and the attempt does not fail politely — it takes the
+renderer down, which surfaces as "Page crashed" and nothing else. A binding is installed by the driver
+over the DevTools protocol, so no page policy applies to it. Audio crosses as base64 in JSON, which at ten
+frames a second is nothing.
+
+**The taps are ScriptProcessorNodes, not AudioWorklets.** A worklet's code has to be fetched as a module,
+and Teams' CSP refuses both `blob:` and `data:` module URLs, so a worklet cannot be installed there at
+all. ScriptProcessorNode is deprecated and is also the only thing that works in both products today.
 
 Two AudioContexts, and the reason is a trap worth naming. **Chrome hands WebRTC a silent track from a
 `MediaStreamAudioDestinationNode` whose context is not at the browser's native sample rate.** No error, in

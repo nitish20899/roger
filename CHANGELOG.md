@@ -15,6 +15,14 @@
   - `platforms/google_meet.py` and `platforms/teams.py` are *only* selectors and a join flow. Adding a
     platform is one class; adding a consumer (a recorder, a note-taker) is `meeting.on(Event.AUDIO, fn)`.
   - `attendee.py` still exists behind the same interface as an opt-in fallback: `MEETING_PROVIDER=attendee`.
+- **Three things the meeting products simply do not allow**, each found the hard way and each pinned by
+  a test:
+  - A page script cannot open a WebSocket to `127.0.0.1` inside Google Meet: the CSP forbids it and the
+    attempt crashes the renderer outright. Audio crosses on a Playwright binding (DevTools protocol)
+    instead, which no page policy can touch.
+  - An AudioWorklet cannot be installed inside Teams: its CSP refuses `blob:` and `data:` module URLs.
+    The taps are `ScriptProcessorNode`s -- deprecated, and the only thing that works in both products.
+  - Chrome hands WebRTC a silent track from an AudioContext that is not at the browser's native rate.
 - **Fixed a bug that made Roger mute in every meeting.** Chrome hands WebRTC a *silent* track from a
   `MediaStreamAudioDestinationNode` whose AudioContext is not at the browser's native sample rate --
   correctly formed, completely empty, no error anywhere. The outbound context now runs at the browser's

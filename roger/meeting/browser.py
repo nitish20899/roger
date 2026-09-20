@@ -3,10 +3,15 @@
 Roger opens Chromium, walks into the call the way a person would, and swaps the microphone for one that
 carries GPT-Live's voice. No meeting-bot service is involved and nothing but OpenAI is billed.
 
-The trick is entirely in the page. ``assets/bridge.js`` is injected before the meeting app's own scripts
-and patches ``getUserMedia`` to hand out a synthetic microphone, taps every inbound WebRTC audio track,
-and opens one WebSocket back to Roger's own server for the audio in both directions. Everything here is
-the Python half of that: launching the browser, serving that socket, and turning frames into events.
+The trick is entirely in the page. ``assets/bridge.js`` is injected before the meeting app's own scripts,
+patches ``getUserMedia`` to hand out a synthetic microphone, and taps every inbound WebRTC audio track.
+Everything here is the Python half: launching the browser, carrying audio both ways, and turning what
+comes back into events.
+
+Audio crosses on a Playwright binding rather than a WebSocket, and that is a scar. A page script cannot
+open a socket to ``127.0.0.1`` from inside Google Meet -- the site's Content-Security-Policy forbids it,
+and the attempt takes the renderer down with it, which reads as "the page crashed" and nothing else. A
+binding is installed by the driver over the DevTools protocol, so no page policy applies.
 
 What differs between Google Meet and Teams is only which buttons to press, and that lives in
 ``platforms/``. This file has no product-specific knowledge at all.
@@ -14,16 +19,15 @@ What differs between Google Meet and Teams is only which buttons to press, and t
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
-import struct
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse
-
-from aiohttp import WSMsgType, web
 
 from ..audio import rms
 from .base import ChatMessage, Event, MeetingClient, Participant, State, UnsupportedMeeting, register
@@ -31,7 +35,7 @@ from .base import ChatMessage, Event, MeetingClient, Participant, State, Unsuppo
 log = logging.getLogger("roger.meeting.browser")
 
 ASSETS = Path(__file__).resolve().parent / "assets"
-WS_PATH = "/ws/browser"
+BINDING = "__rogerSend"
 FRAME_MS = 100
 
 # Chromium is told to behave like a person at a desk with a webcam: grant the media prompt, allow audio to
@@ -123,7 +127,7 @@ class BrowserMeeting(MeetingClient):
     """A participant that is a browser on this machine."""
 
     name = "browser"
-    ws_path = WS_PATH
+    ws_path = None  # nothing dials in: the page is driven over the DevTools protocol
 
     def __init__(self, s: Any) -> None:
         super().__init__()
@@ -133,7 +137,7 @@ class BrowserMeeting(MeetingClient):
         self._pw = None
         self._ctx = None
         self.page: Any = None
-        self._ws: web.WebSocketResponse | None = None
+        self._linked = False   # the page has said hello over the binding
         self._watch: asyncio.Task | None = None
         self._streams: dict[int, str] = {}  # page stream id -> the WebRTC track id behind it
         self._energy: dict[int, tuple[float, float]] = {}  # stream id -> (last frame time, loudness)
@@ -150,13 +154,11 @@ class BrowserMeeting(MeetingClient):
     # ------------------------------------------------------------------ the page script
     def _bridge_js(self) -> str:
         cfg = {
-            "ws_url": f"ws://127.0.0.1:{self.s.port}{WS_PATH}",
             "rate": self.rate,
             "frame_ms": FRAME_MS,
             "bot_name": self.s.bot_name,
             "per_participant": bool(self.s.per_participant_audio),
             "debug": bool(getattr(self.s, "browser_debug", False)),
-            "frame_id": "top",
         }
         return (ASSETS / "bridge.js").read_text().replace("__ROGER_CFG__", json.dumps(cfg))
 
@@ -190,6 +192,8 @@ class BrowserMeeting(MeetingClient):
             permissions=["microphone", "camera"],
             ignore_default_args=["--enable-automation", "--mute-audio"],
         )
+        # The binding must exist before any page script runs, so it goes on the context, not the page.
+        await self._ctx.expose_binding(BINDING, self._on_binding)
         await self._ctx.add_init_script(self._bridge_js())
         self.page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         if getattr(self.s, "browser_debug", False):
@@ -245,31 +249,22 @@ class BrowserMeeting(MeetingClient):
             await asyncio.sleep(1)
         await self._set_state(State.LEFT)
 
-    # ------------------------------------------------------------------ the page socket
-    async def handle_ws(self, request: web.Request) -> web.WebSocketResponse:
-        """``/ws/browser``: the injected script's link back to Roger. Audio both ways."""
-        ws = web.WebSocketResponse(heartbeat=25, max_msg_size=8 * 1024 * 1024)
-        await ws.prepare(request)
-        self._ws = ws
-        self.page_connected_at = time.time()
-        log.info("page bridge connected")
+    # ------------------------------------------------------------------ the link to the page
+    async def _on_binding(self, _source: Any, raw: str) -> bool:
+        """Everything the page sends. One function, because a binding is one function."""
         try:
-            async for msg in ws:
-                if msg.type is WSMsgType.BINARY:
-                    await self._on_page_audio(msg.data)
-                elif msg.type is WSMsgType.TEXT:
-                    await self._on_page_event(msg.data)
-        finally:
-            if self._ws is ws:
-                self._ws = None
-            log.info("page bridge closed after %d frames in, %d out", self.frames_in, self.frames_out)
-        return ws
+            await self._on_page_event(raw)
+        except Exception as e:
+            log.warning("page message failed: %s", e)
+        return True
 
-    async def _on_page_audio(self, data: bytes) -> None:
-        if len(data) < 6:
+    async def _on_page_audio(self, stream_id: int, payload: str) -> None:
+        try:
+            pcm = base64.b64decode(payload)
+        except (binascii.Error, ValueError):
             return
-        stream_id = struct.unpack_from("<I", data, 0)[0]
-        pcm = data[4:]
+        if len(pcm) < 2:
+            return
         self.frames_in += 1
         if stream_id == 0:
             await self.events.emit(Event.AUDIO, pcm, self.rate)
@@ -283,7 +278,10 @@ class BrowserMeeting(MeetingClient):
         except json.JSONDecodeError:
             return
         kind = m.get("type")
-        if kind == "hello":
+        if kind == "audio":
+            await self._on_page_audio(int(m.get("stream") or 0), str(m.get("pcm") or ""))
+        elif kind == "hello":
+            self._linked = True
             log.info("page bridge ready: %s Hz, %s-sample frames", m.get("rate"), m.get("frame"))
         elif kind == "audio_format":
             # The page tells us what the browser actually gave it; capture is already at our wire rate.
@@ -302,18 +300,28 @@ class BrowserMeeting(MeetingClient):
                 await self._saw_participant(Participant(str(row.get("id") or row.get("name")), str(row.get("name") or "Someone")))
 
     async def _command(self, **payload: Any) -> None:
-        if self._ws is not None and not self._ws.closed:
-            await self._ws.send_str(json.dumps(payload))
+        if self.page is None or self.page.is_closed():
+            return
+        try:
+            await self.page.evaluate("m => window.__rogerBridge && window.__rogerBridge.command(m)", json.dumps(payload))
+        except Exception as e:
+            log.debug("command %s: %s", payload.get("type"), e)
 
     # ------------------------------------------------------------------ being a participant
     async def send_audio(self, pcm: bytes) -> None:
         """Roger speaks: straight into the page's synthetic microphone."""
-        if self._ws is not None and not self._ws.closed and pcm:
-            try:
-                await self._ws.send_bytes(pcm)
-                self.frames_out += 1
-            except Exception as e:
-                log.warning("send_audio: %s", e)
+        if not pcm or not self._linked or self.page is None or self.page.is_closed():
+            return
+        try:
+            ok = await self.page.evaluate(
+                "b => window.__rogerBridge && window.__rogerBridge.play(b)",
+                base64.b64encode(pcm).decode(),
+            )
+        except Exception as e:
+            log.debug("send_audio: %s", e)
+            return
+        if ok:
+            self.frames_out += 1
 
     async def flush_audio(self) -> None:
         """Drop whatever has been handed to the page but not yet spoken (an interruption)."""
@@ -340,6 +348,7 @@ class BrowserMeeting(MeetingClient):
         await self.close()
 
     async def close(self) -> None:
+        self._linked = False
         if self._watch:
             self._watch.cancel()
             self._watch = None
@@ -357,7 +366,7 @@ class BrowserMeeting(MeetingClient):
             "provider": self.name,
             "platform": self.platform.name if self.platform else None,
             "state": self.state.value,
-            "page_connected": self._ws is not None and not self._ws.closed,
+            "page_connected": self._linked,
             "frames_in": self.frames_in,
             "frames_out": self.frames_out,
             "audio_streams": len(self._streams),

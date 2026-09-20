@@ -4,15 +4,18 @@
  * This runs before the meeting app's own scripts, in every frame. It does three things:
  *
  *   1. Hands the meeting app a microphone that is really us. `getUserMedia` is patched to return a
- *      MediaStream fed by an AudioWorklet, so when Roger speaks, the call hears a normal participant.
+ *      MediaStream we write Roger's voice into, so the call hears an ordinary participant.
  *   2. Taps every inbound audio track by wrapping `RTCPeerConnection`, mixes them for transcription and
  *      keeps each one separately so we can tell who is talking.
- *   3. Carries that audio to and from Python over one WebSocket to Roger's own local server.
+ *   3. Carries that audio to and from Python.
  *
- * Wire format. Binary both ways, because this is the hot path:
- *   page -> python   <uint32 LE stream id><pcm16le frame>      stream 0 is the mix
- *   python -> page   <pcm16le frame>                            what Roger says
- * Everything else -- chat, participants, state -- is JSON text on the same socket.
+ * The transport is a Playwright binding, not a WebSocket, and that is not a detail. A page script cannot
+ * open a socket back to `127.0.0.1` from inside Google Meet: its Content-Security-Policy forbids the
+ * connection, and the attempt takes the renderer down with it. A binding is installed by the driver
+ * itself, over the DevTools protocol, so no page policy applies to it.
+ *
+ *   page -> python   window.__rogerSend(json)     audio frames carry base64 PCM
+ *   python -> page   window.__rogerBridge.play(b64) / .command(json)
  *
  * Configuration is substituted in by browser.py before injection: __ROGER_CFG__.
  */
@@ -35,66 +38,45 @@
   // Inbound runs at Roger's wire rate, because `createMediaStreamSource` resamples into its context for
   // free and in better quality than we would manage by hand. Capture therefore arrives ready to send.
   const bridge = {
-    ws: null, outCtx: null, inCtx: null, mic: null, micNode: null, mixer: null,
+    outCtx: null, inCtx: null, mic: null, micNode: null, mixer: null,
     tracks: new Map(), nextStreamId: 1, ready: false, sent: 0, recv: 0,
   };
   window.__rogerBridge = bridge;
 
-  // ------------------------------------------------------------------ worklets
-  // Out: drains a queue of Float32 frames into the fake microphone, silence when empty.
-  // In:  accumulates FRAME samples and posts them up. Chrome calls process() with 128 samples.
-  const WORKLET = `
-    class RogerOut extends AudioWorkletProcessor {
-      constructor() { super(); this.q = []; this.cur = null; this.pos = 0;
-        this.port.onmessage = (e) => {
-          if (e.data === "flush") { this.q.length = 0; this.cur = null; return; }
-          this.q.push(e.data);
-          while (this.q.length > 200) this.q.shift();   // a stall must not become unbounded latency
-        };
-      }
-      process(_i, outputs) {
-        const out = outputs[0][0]; if (!out) return true;
-        let i = 0;
-        while (i < out.length) {
-          if (!this.cur) { if (!this.q.length) break; this.cur = this.q.shift(); this.pos = 0; }
-          const n = Math.min(out.length - i, this.cur.length - this.pos);
-          out.set(this.cur.subarray(this.pos, this.pos + n), i);
-          i += n; this.pos += n;
-          if (this.pos >= this.cur.length) this.cur = null;
-        }
-        while (i < out.length) out[i++] = 0;
-        return true;
-      }
-    }
-    class RogerIn extends AudioWorkletProcessor {
-      constructor(opts) { super(); this.frame = opts.processorOptions.frame;
-        this.buf = new Float32Array(this.frame); this.n = 0; }
-      process(inputs) {
-        const ch = inputs[0] && inputs[0][0]; if (!ch) return true;
-        for (let i = 0; i < ch.length; i++) {
-          this.buf[this.n++] = ch[i];
-          if (this.n === this.frame) { this.port.postMessage(this.buf.slice()); this.n = 0; }
-        }
-        return true;
-      }
-    }
-    registerProcessor("roger-out", RogerOut);
-    registerProcessor("roger-in", RogerIn);
-  `;
+  // ------------------------------------------------------------------ the audio graph
+  //
+  // ScriptProcessorNode, not AudioWorklet, and deliberately. An AudioWorklet's code has to be fetched as
+  // a module, and Microsoft Teams' Content-Security-Policy refuses both `blob:` and `data:` module URLs,
+  // so a worklet cannot be installed there at all. ScriptProcessorNode needs no module, is supported
+  // everywhere Roger runs, and at one 4096-sample callback per ~85 ms costs nothing worth measuring.
+  // It is deprecated; it is also the only thing that works in both products today.
+  const OUT_BUFFER = 4096;  // at the browser's rate; underruns here are audible, so this is the safe one
+  const IN_BUFFER = 2048;   // at RATE; smaller, because this is latency on Roger's ears
 
   // ------------------------------------------------------------------ conversion
   const toPcm16 = (f32) => {
-    const b = new ArrayBuffer(4 + f32.length * 2), v = new DataView(b);
+    const b = new ArrayBuffer(f32.length * 2), v = new DataView(b);
     for (let i = 0; i < f32.length; i++) {
       let s = f32[i]; s = s < -1 ? -1 : s > 1 ? 1 : s;
-      v.setInt16(4 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      v.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
     }
-    return { buf: b, view: v };
+    return new Uint8Array(b);
   };
-  const fromPcm16 = (ab) => {
-    const v = new DataView(ab), n = ab.byteLength >> 1, f = new Float32Array(n);
+  const fromPcm16 = (bytes) => {
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const n = bytes.byteLength >> 1, f = new Float32Array(n);
     for (let i = 0; i < n; i++) f[i] = v.getInt16(i * 2, true) / 0x8000;
     return f;
+  };
+  const b64 = (bytes) => {
+    let s = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
+  const unb64 = (str) => {
+    const bin = atob(str), n = bin.length, out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) out[i] = bin.charCodeAt(i);
+    return out;
   };
   // Only ever used to go *up* from the wire rate to the browser's, which needs no anti-alias filter.
   const upsample = (f32, from, to) => {
@@ -108,31 +90,59 @@
     return out;
   };
 
-  // ------------------------------------------------------------------ audio graph
-  const WORKLET_URL = () => URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  // A tap: hand every FRAME samples that pass through to Python. A ScriptProcessorNode is only pulled
+  // if its output leads somewhere, so each one ends at a silent gain node into the destination.
+  function tap(ctx, onFrame) {
+    const node = ctx.createScriptProcessor(IN_BUFFER, 1, 1);
+    let buf = new Float32Array(FRAME), n = 0;
+    node.onaudioprocess = (e) => {
+      const ch = e.inputBuffer.getChannelData(0);
+      for (let i = 0; i < ch.length; i++) {
+        buf[n++] = ch[i];
+        if (n === FRAME) { onFrame(buf); buf = new Float32Array(FRAME); n = 0; }
+      }
+    };
+    const silent = ctx.createGain();
+    silent.gain.value = 0;
+    node.connect(silent);
+    silent.connect(ctx.destination);
+    return node;
+  }
 
   async function audio() {
     if (bridge.inCtx) return bridge;
 
     // Outbound, at the browser's own rate (no sampleRate option: whatever it picks is the native one).
     const outCtx = new AudioContext({ latencyHint: "interactive" });
-    let url = WORKLET_URL();
-    await outCtx.audioWorklet.addModule(url);
-    URL.revokeObjectURL(url);
-    bridge.micNode = new AudioWorkletNode(outCtx, "roger-out", { numberOfInputs: 0, outputChannelCount: [1] });
+    const queue = [];
+    let cur = null, pos = 0;
+    const micNode = outCtx.createScriptProcessor(OUT_BUFFER, 1, 1);
+    micNode.onaudioprocess = (e) => {
+      const out = e.outputBuffer.getChannelData(0);
+      let i = 0;
+      while (i < out.length) {
+        if (!cur) { if (!queue.length) break; cur = queue.shift(); pos = 0; }
+        const n = Math.min(out.length - i, cur.length - pos);
+        out.set(cur.subarray(pos, pos + n), i);
+        i += n; pos += n;
+        if (pos >= cur.length) cur = null;
+      }
+      while (i < out.length) out[i++] = 0;   // silence when Roger is not talking
+    };
     const dest = outCtx.createMediaStreamDestination();
-    bridge.micNode.connect(dest);
+    micNode.connect(dest);
+    bridge.micNode = micNode;
     bridge.mic = dest.stream;
+    bridge.enqueue = (f32) => {
+      queue.push(f32);
+      while (queue.length > 200) queue.shift();   // a stall must not become unbounded latency
+    };
+    bridge.flushOut = () => { queue.length = 0; cur = null; };
 
     // Inbound, at Roger's wire rate, so captured frames need no conversion before they are sent.
     const inCtx = new AudioContext({ sampleRate: RATE, latencyHint: "interactive" });
-    url = WORKLET_URL();
-    await inCtx.audioWorklet.addModule(url);
-    URL.revokeObjectURL(url);
     bridge.mixer = inCtx.createGain();
-    const mixTap = new AudioWorkletNode(inCtx, "roger-in", { processorOptions: { frame: FRAME }, numberOfOutputs: 0 });
-    mixTap.port.onmessage = (e) => sendAudio(0, e.data);
-    bridge.mixer.connect(mixTap);
+    bridge.mixer.connect(tap(inCtx, (f32) => sendAudio(0, f32)));
 
     for (const c of [outCtx, inCtx]) if (c.state === "suspended") c.resume().catch(() => {});
     bridge.outCtx = outCtx;
@@ -143,11 +153,7 @@
   }
 
   function sendAudio(streamId, f32) {
-    const ws = bridge.ws;
-    if (!ws || ws.readyState !== 1) return;
-    const { buf, view } = toPcm16(f32);
-    view.setUint32(0, streamId, true);
-    ws.send(buf);
+    if (!send({ type: "audio", stream: streamId, pcm: b64(toPcm16(f32)) })) return;
     bridge.sent++;
   }
 
@@ -167,13 +173,12 @@
     src.connect(bridge.mixer);
 
     const streamId = bridge.nextStreamId++;
-    let tap = null;
+    let own = null;
     if (CFG.per_participant) {
-      tap = new AudioWorkletNode(ctx, "roger-in", { processorOptions: { frame: FRAME }, numberOfOutputs: 0 });
-      tap.port.onmessage = (e) => sendAudio(streamId, e.data);
-      src.connect(tap);
+      own = tap(ctx, (f32) => sendAudio(streamId, f32));
+      src.connect(own);
     }
-    bridge.tracks.set(track.id, { streamId, src, tap, sink, track });
+    bridge.tracks.set(track.id, { streamId, src, tap: own, sink, track });
     send({ type: "track", stream_id: streamId, track_id: track.id, label: label || "" });
     log("remote track", track.id, "-> stream", streamId);
 
@@ -242,49 +247,59 @@
     window.webkitRTCPeerConnection = window.RTCPeerConnection;
   }
 
-  // ------------------------------------------------------------------ the socket
+  // ------------------------------------------------------------------ the link to Python
+  //
+  // `window.__rogerSend` is installed by the driver before any page script runs. It is a plain function,
+  // so Content-Security-Policy has nothing to say about it -- which is the whole reason it is not a socket.
   function send(obj) {
-    const ws = bridge.ws;
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+    const fn = window.__rogerSend;
+    if (typeof fn !== "function") return false;
+    try {
+      fn(JSON.stringify(obj));
+      return true;
+    } catch (e) {
+      return false;   // the page is going away mid-call; the next frame will find out
+    }
   }
   bridge.send = send;
 
-  function connect() {
-    let ws;
-    try { ws = new WebSocket(CFG.ws_url); } catch (e) { return setTimeout(connect, 1000); }
-    ws.binaryType = "arraybuffer";
-    bridge.ws = ws;
+  // Called from Python. Roger speaking: up to the browser's rate, then into the microphone worklet.
+  bridge.play = (payload) => {
+    if (!bridge.enqueue) return false;
+    bridge.recv++;
+    bridge.enqueue(upsample(fromPcm16(unb64(payload)), RATE, bridge.outCtx.sampleRate));
+    return true;
+  };
 
-    ws.onopen = () => {
-      bridge.ready = true;
-      send({ type: "hello", rate: RATE, frame: FRAME, url: location.href, frame_id: CFG.frame_id });
-      audio().catch((e) => log("audio init failed", e));
-      log("socket open");
-    };
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") {
-        let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
-        const fn = bridge.commands && bridge.commands[m.type];
-        if (fn) { try { fn(m); } catch (e) { log("command " + m.type + " failed", e); } }
-        return;
-      }
-      // Roger speaking: up to the browser's rate, then straight into the microphone worklet.
-      if (!bridge.micNode) return;
-      bridge.recv++;
-      bridge.micNode.port.postMessage(upsample(fromPcm16(ev.data), RATE, bridge.outCtx.sampleRate));
-    };
-    ws.onclose = () => { bridge.ready = false; bridge.ws = null; setTimeout(connect, 800); };
-    ws.onerror = () => { try { ws.close(); } catch (_) {} };
-  }
-
-  // Commands from Python. Platform code adds its own (chat, leave) via registerCommand.
+  // Commands from Python. Platform code adds its own via registerCommand.
   bridge.commands = {
-    flush: () => bridge.micNode && bridge.micNode.port.postMessage("flush"),
-    ping: () => send({ type: "pong", sent: bridge.sent, recv: bridge.recv, tracks: bridge.tracks.size }),
+    flush: () => bridge.flushOut && bridge.flushOut(),
+    stats: () => send({ type: "stats", sent: bridge.sent, recv: bridge.recv, tracks: bridge.tracks.size }),
   };
   bridge.registerCommand = (name, fn) => { bridge.commands[name] = fn; };
+  bridge.command = (raw) => {
+    let m;
+    try { m = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (e) { return false; }
+    const fn = bridge.commands[m && m.type];
+    if (!fn) return false;
+    try { fn(m); return true; } catch (e) { log("command " + m.type + " failed", e); return false; }
+  };
 
-  // Only the top frame owns the socket; sub-frames still get the patched getUserMedia above.
-  if (window.top === window) connect();
+  // Only the top frame talks to Python; sub-frames still get the patched getUserMedia above, which is
+  // all they are here for. The binding may land a tick after this script, so wait for it rather than
+  // assuming -- a missed hello would mean a bot that hears nothing and never says why.
+  if (window.top === window) {
+    let tries = 0;
+    const begin = () => {
+      if (typeof window.__rogerSend !== "function") {
+        if (++tries > 600) return log("no link to Python after 60s; giving up");
+        return setTimeout(begin, 100);
+      }
+      bridge.ready = true;
+      send({ type: "hello", rate: RATE, frame: FRAME, url: location.href });
+      audio().catch((e) => log("audio init failed", e));
+    };
+    begin();
+  }
   log("installed in", location.href);
 })();
