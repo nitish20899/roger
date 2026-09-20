@@ -1,16 +1,19 @@
-"""The local server, and the public URL that reaches it.
+"""The local server: the control API, the monitor page, and the meeting's audio socket.
 
-The Attendee bot connects here over a WebSocket: meeting audio in, the bot's voice out. A small monitor
-page at ``/monitor`` plays that voice locally, which is how you hear the bot without joining a call.
+Whichever participant is in use connects here over a WebSocket -- meeting audio in, the bot's voice out --
+on a route the provider itself names. For the default browser participant that is a page on this machine
+talking to ``127.0.0.1``, so nothing has to be reachable from the internet.
 
-Attendee has to reach this machine, so unless ``PUBLIC_URL`` is set a Cloudflare quick tunnel is started
-in front of it. That needs ``cloudflared`` on PATH and no Cloudflare account.
+A hosted participant is the exception: it dials in from outside, so ``PUBLIC_URL`` is needed, or a
+Cloudflare quick tunnel is started in front of the server (``cloudflared`` on PATH, no account).
+
+A small monitor page at ``/monitor`` plays the bot's voice locally, which is how you hear it without
+joining a call.
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
-import base64
 import json
 import logging
 import re
@@ -24,6 +27,7 @@ from aiohttp import WSMsgType, web
 from .audio import tone
 from .bridge import Bridge
 from .config import STATIC_DIR, Settings
+from .meeting import UnsupportedMeeting
 
 log = logging.getLogger("roger.server")
 
@@ -51,10 +55,10 @@ def start_tunnel(port: int, timeout: float = 25.0) -> tuple[str, subprocess.Pope
 
 
 def public_url(s: Settings) -> str | None:
-    """The URL Attendee will dial back on: yours if set, otherwise a quick tunnel."""
+    """A URL that reaches this machine from outside. Only a hosted participant needs one."""
     if s.public_url:
         return s.public_url
-    if not shutil.which("cloudflared"):
+    if not s.hosted_participant or not shutil.which("cloudflared"):
         return None
     log.info("starting a Cloudflare quick tunnel ...")
     url, proc = start_tunnel(s.port)
@@ -92,49 +96,9 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
             bridge.speaker.monitors.discard(ws)
         return ws
 
-    async def h_ws_attendee(request: web.Request) -> web.WebSocketResponse:
-        """The Attendee bot connects here: meeting audio in, bot voice out."""
-        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=16 * 1024 * 1024)
-        await ws.prepare(request)
-        bridge.speaker.bot_ws = ws
-        log.info("attendee: audio websocket connected")
-        asyncio.create_task(bridge.greet())
-        frames = 0
-        seen: set[str] = set()  # one line per stream: they start at different times
-
-        def first(trigger: str, rate) -> None:
-            if trigger not in seen:
-                seen.add(trigger)
-                log.info("attendee: receiving %s audio (sample_rate=%s)", trigger, rate)
-                if trigger == "mixed" and rate and int(rate) != s.sample_rate:
-                    log.warning("attendee: mixed audio is %s Hz but the live session is %s Hz; set AUDIO_RATE=%s to match", rate, s.sample_rate, rate)
-
-        try:
-            async for msg in ws:
-                if msg.type != WSMsgType.TEXT:
-                    continue
-                try:
-                    evt = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    continue
-                trig = evt.get("trigger", "")
-                data = evt.get("data", {})
-                chunk = data.get("chunk")
-                if trig == "realtime_audio.mixed" and chunk:
-                    frames += 1
-                    first("mixed", data.get("sample_rate"))
-                    await bridge.on_audio(base64.b64decode(chunk))
-                elif trig == "realtime_audio.per_participant" and chunk:
-                    frames += 1
-                    first("per-participant", data.get("sample_rate"))
-                    await bridge.on_participant_audio(str(data.get("participant_uuid")), base64.b64decode(chunk))
-                else:
-                    log.debug("attendee event %s", trig)
-        finally:
-            if bridge.speaker.bot_ws is ws:
-                bridge.speaker.bot_ws = None
-            log.info("attendee: audio websocket closed after %d frames", frames)
-        return ws
+    async def h_ws_meeting(request: web.Request) -> web.WebSocketResponse:
+        """The active participant's audio socket, on whichever route that provider asked for."""
+        return await bridge.meeting.handle_ws(request)
 
     async def h_join(request: web.Request) -> web.Response:
         body = await request.json()
@@ -143,12 +107,15 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
             return web.json_response({"error": "meeting_url required"}, status=400)
         try:
             bot_id = await bridge.join(url)
+        except UnsupportedMeeting as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
+            log.warning("join failed: %s", e)
             return web.json_response({"error": str(e)}, status=500)
         return web.json_response({"bot_id": bot_id})
 
     async def h_leave(_: web.Request) -> web.Response:
-        await bridge.attendee.leave()
+        await bridge.leave()
         return web.json_response({"ok": True})
 
     async def h_say(request: web.Request) -> web.Response:
@@ -185,7 +152,6 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
         web.get("/", h_index),
         web.get("/monitor", h_monitor),
         web.get("/ws/monitor", h_ws_monitor),
-        web.get("/ws/attendee", h_ws_attendee),
         web.post("/join", h_join),
         web.post("/leave", h_leave),
         web.post("/say", h_say),
@@ -193,6 +159,9 @@ def build_app(bridge: Bridge, s: Settings) -> web.Application:
         web.get("/test/tone", h_tone),
         web.get("/health", h_health),
     ]
+    if bridge.meeting.ws_path:
+        routes.append(web.get(bridge.meeting.ws_path, h_ws_meeting))
+        log.info("meeting audio socket at %s (%s participant)", bridge.meeting.ws_path, bridge.meeting.name)
     app.add_routes(routes)
     return app
 
@@ -219,15 +188,16 @@ async def serve(s: Settings, meeting_url: str | None = None, leave_on_exit: bool
         log.info("ready: local http://localhost:%d/monitor  public %s", s.port, s.public_url or "(none)")
         log.info("config: %s", json.dumps(s.summary()))
         if meeting_url:
-            bot_id = await bridge.join(meeting_url)
-            log.info("bot %s is joining %s; if it lands in the waiting room, admit \"%s\". Press Ctrl-C to leave.", bot_id, meeting_url, s.bot_name)
+            await bridge.join(meeting_url)
+            log.info("joining %s; if it lands in a waiting room, admit \"%s\". Press Ctrl-C to leave.", meeting_url, s.bot_name)
         await stop.wait()
     finally:
         log.info("shutting down")
-        if bridge.attendee.bot_id:
-            if leave_on_exit:
+        if bridge.meeting.state.live:
+            if leave_on_exit or bridge.meeting.name == "browser":
+                # A browser participant is this process. Nothing survives the exit, so it always leaves.
                 try:
-                    await bridge.attendee.leave()
+                    await bridge.leave()
                 except Exception as e:
                     log.warning("leave failed: %s", e)
             else:

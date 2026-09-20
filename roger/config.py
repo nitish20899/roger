@@ -1,7 +1,8 @@
 """Configuration. Everything comes from environment variables, normally through a ``.env`` file.
 
-``.env.example`` at the repository root documents every variable. Only three keys are required:
-``ATTENDEE_API_KEY`` and ``OPENAI_API_KEY``. Those are the only two services Roger talks to.
+``.env.example`` at the repository root documents every variable. Exactly one is required:
+``OPENAI_API_KEY``. Roger joins meetings with a browser it drives itself, so OpenAI is the only service
+involved and the only thing billed.
 """
 from __future__ import annotations
 
@@ -65,17 +66,20 @@ class Settings:
     public_url: str | None = None
     state_dir: Path = field(default_factory=lambda: Path.home() / ".roger")
 
-    # meeting bot (Attendee)
+    # how Roger gets into the call: "browser" drives Chromium here, "attendee" hands it to a hosted service
+    meeting_provider: str = "browser"
+    browser_headless: bool = False  # headed by default: you can watch it join, and sign in once for later
+    browser_debug: bool = False     # log the injected bridge's console output
+
+    # the hosted alternative, only read when meeting_provider == "attendee"
     attendee_api_key: str | None = None
     attendee_base: str = "https://app.attendee.dev/api/v1"
-    attendee_use_login: bool = False  # join Teams / Meet with a signed-in bot account configured in Attendee
-    attendee_login_group: str | None = None
 
     # voice and hearing (OpenAI GPT-Live: one full-duplex session does both)
     live_model: str = LIVE_MODEL
     voice: str = "cedar"  # GPT-Live's male flagship voice; "marin" is its female counterpart
     language: str = "en"
-    sample_rate: int = 24000  # GPT-Live's native rate, and what Attendee wants for an OpenAI voice
+    sample_rate: int = 24000  # GPT-Live's native rate; the meeting page captures at it, so nothing resamples
     # Measured delivery from GPT-Live stalls for up to ~360 ms now and then. The cushion has to be longer
     # than the longest stall or the far end runs dry mid-word, which is heard as distortion rather than a gap.
     output_buffer_ms: int = 500
@@ -113,10 +117,12 @@ class Settings:
         s.public_url = (env("PUBLIC_URL") or None) and env("PUBLIC_URL").rstrip("/")
         s.state_dir = Path(env("ROGER_STATE_DIR", str(s.state_dir))).expanduser()
 
+        s.meeting_provider = (env("MEETING_PROVIDER", s.meeting_provider) or s.meeting_provider).strip().lower()
+        s.browser_headless = flag("BROWSER_HEADLESS", False)
+        s.browser_debug = flag("BROWSER_DEBUG", False)
+
         s.attendee_api_key = env("ATTENDEE_API_KEY")
         s.attendee_base = (env("ATTENDEE_BASE", s.attendee_base) or s.attendee_base).rstrip("/")
-        s.attendee_use_login = flag("ATTENDEE_USE_LOGIN", False)
-        s.attendee_login_group = env("ATTENDEE_LOGIN_GROUP")
 
         s.live_model = env("LIVE_MODEL", s.live_model)
         s.sample_rate = int(env("AUDIO_RATE", str(s.sample_rate)))
@@ -165,6 +171,11 @@ class Settings:
         return int(self.sample_rate * 2 * 0.1)
 
     @property
+    def hosted_participant(self) -> bool:
+        """True when a service joins the call for us, which is the only case needing a key and a public URL."""
+        return self.meeting_provider == "attendee"
+
+    @property
     def owner_possessive(self) -> str:
         """``"Alice's"`` or ``"the team's"``."""
         return f"{self.owner_name}'s" if self.owner_name else "the team's"
@@ -172,8 +183,16 @@ class Settings:
     def problems(self) -> list[str]:
         """Human-readable configuration problems that would stop a meeting from working."""
         out: list[str] = []
-        if not self.attendee_api_key:
-            out.append("ATTENDEE_API_KEY is missing (sign up at https://app.attendee.dev, then Settings > API keys)")
+        if self.hosted_participant:
+            if not self.attendee_api_key:
+                out.append("MEETING_PROVIDER=attendee needs ATTENDEE_API_KEY (or drop it and use the built-in browser participant)")
+            if not self.public_url and not shutil.which("cloudflared"):
+                out.append(
+                    "a hosted participant has to reach this machine: install cloudflared (brew install cloudflared) "
+                    "or set PUBLIC_URL. The default browser participant needs neither."
+                )
+        elif self.meeting_provider not in ("browser", "auto"):
+            out.append(f"MEETING_PROVIDER is {self.meeting_provider!r}; it must be 'browser', 'attendee' or 'auto'")
         if not self.openai_api_key:
             out.append("OPENAI_API_KEY is missing: GPT-Live is both the ears and the voice (https://platform.openai.com/api-keys)")
         if self.voice not in LIVE_VOICES and not self.voice.startswith("voice_"):
@@ -181,9 +200,7 @@ class Settings:
         if self.sample_rate not in (8000, 16000, 24000):
             out.append(f"AUDIO_RATE must be 8000, 16000 or 24000, not {self.sample_rate} (GPT-Live accepts 16000 or 24000)")
         elif self.sample_rate == 8000:
-            out.append("AUDIO_RATE 8000 is accepted by Attendee but not by GPT-Live over a WebSocket; use 16000 or 24000")
-        if not self.public_url and not shutil.which("cloudflared"):
-            out.append("cloudflared is not installed and PUBLIC_URL is empty: install cloudflared (brew install cloudflared) or set PUBLIC_URL to a public https URL that reaches this machine")
+            out.append("AUDIO_RATE 8000 is too low for GPT-Live over a WebSocket; use 16000 or 24000")
         return out
 
     def summary(self) -> dict:
@@ -199,5 +216,6 @@ class Settings:
             "codex_session": (self.codex_session_id or "")[:8] or None,
             "repo_tools": self.repo_tools,
             "web_search": self.web_search,
-            "keys": {"attendee": bool(self.attendee_api_key), "openai": bool(self.openai_api_key)},
+            "meeting_provider": self.meeting_provider,
+            "keys": {"openai": bool(self.openai_api_key), "attendee": bool(self.attendee_api_key)},
         }

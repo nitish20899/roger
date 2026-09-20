@@ -1,8 +1,9 @@
 <h1 align="center">Roger</h1>
 
 <p align="center">
-  A voice AI teammate that joins your Google Meet, Microsoft Teams and Zoom calls.<br>
-  It listens, answers when spoken to, and knows what you have been working on.
+  A voice AI teammate that joins your Google Meet and Microsoft Teams calls.<br>
+  It listens, answers when spoken to, and knows what you have been working on.<br>
+  <b>One OpenAI key. No meeting-bot service.</b>
 </p>
 
 <p align="center">
@@ -33,22 +34,22 @@ the web.
 
 ## Install
 
-You need Python 3.11+, [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-(`brew install cloudflared`), and two accounts:
-
-| Service | For | Cost |
-|---|---|---|
-| [Attendee](https://app.attendee.dev) | the participant that joins the meeting | free hours, then hourly |
-| [OpenAI](https://platform.openai.com) | hearing, speaking, thinking and web search | per second of voice, plus tokens |
+Python 3.11+ and an [OpenAI](https://platform.openai.com) key. That is the whole list. Roger joins the
+call itself, in a Chromium it drives on your machine, so there is no meeting-bot service to sign up for
+and nothing to make reachable from the internet.
 
 ```bash
 git clone https://github.com/nitish20899/roger.git
 cd roger
 python3 -m venv .venv && source .venv/bin/activate
-pip install .
-cp .env.example .env     # then paste your two keys
+pip install '.[browser]'
+playwright install chromium
+cp .env.example .env     # then paste your OpenAI key
 roger doctor             # checks everything before you join a call
 ```
+
+The first time, leave `BROWSER_HEADLESS=0` (the default) so you can watch it join. If your meetings need
+a signed-in account, sign in once in that window: the profile under `~/.roger` keeps the login.
 
 ## Use it
 
@@ -89,35 +90,6 @@ run, nothing is billed to them, and your real sessions are never resumed or writ
 is read-only too: Roger can search and read files under `PROJECT_DIR`, and there is deliberately no tool
 that edits, runs or pushes anything.
 
-## Self-hosting Attendee
-
-Attendee is [source-available](https://github.com/attendee-labs/attendee) and can run on your own machine,
-which leaves OpenAI as the only paid API. Roger talks to it over the same REST API either way:
-
-```bash
-git clone https://github.com/attendee-labs/attendee && cd attendee
-docker compose -f dev.docker-compose.yaml build
-docker compose -f dev.docker-compose.yaml run --rm attendee-app-local python init_env.py > .env
-docker compose -f dev.docker-compose.yaml up
-docker compose -f dev.docker-compose.yaml exec attendee-app-local python manage.py migrate
-```
-
-Then create an API key at <http://localhost:8000> and point Roger at it:
-
-```bash
-ATTENDEE_BASE=http://localhost:8000/api/v1
-ATTENDEE_API_KEY=<the key from your own instance>
-```
-
-It is cheaper, not simpler: you are running four app containers plus PostgreSQL and Redis, and Attendee's
-own docs say local Celery is not production-grade (bots die on restart, and bots in one worker share audio
-devices) — production wants Kubernetes. Zoom additionally needs your own Zoom OAuth credentials. The
-hosted service is the easier path; self-hosting is the cheaper one at volume.
-
-Note that Attendee is under the **Elastic License 2.0**, not an OSI open-source licence. Running it
-yourself is fine; redistributing it, or offering it to others as a service, is not. That is also why Roger
-integrates with it over HTTP rather than vendoring any of its code — Roger stays MIT.
-
 ## Configure
 
 Every setting is documented inline in [`.env.example`](.env.example). The ones people actually change:
@@ -130,6 +102,7 @@ Every setting is documented inline in [`.env.example`](.env.example). The ones p
 | `FAST_MODEL` | `gpt-5.6-luna` | the model that does the thinking |
 | `OUTPUT_BUFFER_MS` | `500` | raise it if the voice ever breaks up |
 | `WEB_SEARCH`, `REPO_TOOLS` | `1` | turn either source off |
+| `BROWSER_HEADLESS` | `0` | `1` hides the window once you trust it |
 
 ## How it works, briefly
 
@@ -137,8 +110,12 @@ One [OpenAI GPT-Live](https://developers.openai.com/api/docs/guides/live) sessio
 speaking and the turn-taking on a single full-duplex WebSocket — it listens while it talks, so you can
 genuinely interrupt it. When it needs a fact it *delegates*: OpenAI runs a backend model, hands it the
 conversation, and Roger runs the tools it asks for (searching your repository, posting to the meeting
-chat) while the conversation carries on out loud. [Attendee](https://attendee.dev) puts the participant
-in the call and carries the audio both ways.
+chat) while the conversation carries on out loud.
+
+Getting into the call is Roger's own doing. It opens the meeting in Chromium and walks in like a person,
+having first replaced the page's microphone with one that carries GPT-Live's voice and tapped the inbound
+WebRTC tracks for its ears. Adding a platform means describing which buttons to press; audio, state and
+everything above are already handled.
 
 Longer notes are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -147,8 +124,10 @@ Longer notes are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | | |
 |---|---|
 | `roger doctor` reports a missing key | edit `.env`; it is read from the current directory, then the repo root, then `~/.roger/.env` |
-| The bot joins but never hears anything | `roger status`: `bot_audio_ws` must be true. Attendee needs to reach your public URL over `wss://` |
+| The bot joins but never hears anything | `roger status`: `meeting.page_connected` must be true and `audio_streams` above zero |
 | It sits in the waiting room | Google Meet and Teams often hold guest bots; admit it by name |
+| It cannot find the join button | the page changed. Run with `BROWSER_HEADLESS=0` to watch, and see `roger/meeting/platforms/` |
+| Nobody can hear it | check `roger status`: `frames_out` should be climbing while it talks |
 | The voice breaks up | raise `OUTPUT_BUFFER_MS` (try 700) |
 | It answers itself in a loop | set `ECHO_SUPPRESS=1` |
 | It talks when it should not | say *"hold on, Roger"*; it stays silent until you use its name |
@@ -157,7 +136,12 @@ Longer notes are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Contributing
 
 Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). `make test` runs the suite;
-it needs no API keys.
+it needs no API keys. `ROGER_BROWSER_TESTS=1 pytest tests/test_browser_audio.py` runs the audio path in a
+real browser, which is the one thing unit tests cannot cover.
+
+Supporting another platform is the easiest useful contribution: add a
+[`Platform`](roger/meeting/browser.py) subclass under `roger/meeting/platforms/` that knows which buttons
+to press. Nothing else has to change.
 
 ## License
 

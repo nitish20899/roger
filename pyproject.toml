@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roger-meeting-agent"
-version = "0.4.0"
-description = "Roger: a voice AI teammate that joins your Google Meet, Microsoft Teams and Zoom calls, listens, talks back and posts to chat."
+version = "0.5.0"
+description = "Roger: a voice AI teammate that joins your Google Meet and Microsoft Teams calls, listens, talks back and posts to chat. One OpenAI key, no meeting-bot service."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
@@ -31,7 +31,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# The built-in meeting participant: Chromium driven on this machine, no meeting-bot service.
+# After installing: playwright install chromium
+browser = ["playwright>=1.47"]
+dev = ["pytest>=8", "pyflakes>=3"]
 
 [project.scripts]
 roger = "roger.cli:main"
@@ -44,7 +47,7 @@ Issues = "https://github.com/nitish20899/roger/issues"
 include = ["roger*"]
 
 [tool.setuptools.package-data]
-roger = ["static/*.html"]
+roger = ["static/*.html", "meeting/assets/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

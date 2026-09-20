@@ -1,19 +1,20 @@
 # Architecture
 
-Roger is about 2,500 lines of Python. This is what they do and why.
+Roger is about 3,300 lines of Python and one page of JavaScript. This is what they do and why.
 
 ## The shape of it
 
 ```mermaid
 flowchart LR
-  subgraph Meeting["Google Meet / Teams / Zoom"]
+  subgraph Meeting["Google Meet / Teams"]
     P[People]
     C[Meeting chat]
   end
-  subgraph A["Attendee (cloud browser)"]
-    BOT[bot participant]
+  subgraph B["Chromium on your machine"]
+    PAGE[the meeting page<br/>+ bridge.js]
   end
-  subgraph R["roger serve (your machine, behind a quick tunnel)"]
+  subgraph R["roger serve (your machine)"]
+    MEET[meeting/<br/>join, audio, chat]
     LIVE[live.py<br/>GPT-Live session]
     SPK[speaker.py<br/>jitter buffer]
     TOOLS[tools.py<br/>repo search, chat]
@@ -23,11 +24,46 @@ flowchart LR
     GL[gpt-live-1<br/>hears, speaks, takes turns]
     BE[backend model<br/>+ web search]
   end
-  P --> BOT -- PCM 24 kHz --> LIVE --> GL
+  P --> PAGE -- PCM 24 kHz --> MEET --> LIVE --> GL
   GL -- delegation --> BE -- tool calls --> LIVE --> TOOLS
-  GL -- audio --> SPK --> BOT --> P
+  GL -- audio --> SPK --> MEET --> PAGE --> P
   TOOLS --> C
   CTX -.briefing.-> LIVE
+```
+
+Nothing in that diagram leaves your machine except the calls to OpenAI and the meeting itself.
+
+## Getting into the call
+
+`roger/meeting/` is a small layer with one job: be a participant. Everything above it talks to a
+`MeetingClient` and subscribes to its events, and knows nothing about Google, Microsoft or browsers.
+
+```
+meeting/base.py           the interface: join, leave, send_audio, send_chat + an event bus
+meeting/browser.py        a participant that is Chromium on this machine (the default)
+meeting/assets/bridge.js  the page half: the fake microphone and the audio tap
+meeting/platforms/        which buttons to press, per product
+meeting/attendee.py       the hosted alternative, same interface, opt-in
+```
+
+The browser participant works by injecting `bridge.js` before the meeting app's own scripts. It patches
+`getUserMedia` to hand out a microphone fed by an AudioWorklet — so when Roger speaks, the call hears an
+ordinary participant — and wraps `RTCPeerConnection` to tap every inbound audio track. One WebSocket back
+to `127.0.0.1` carries PCM both ways: `<uint32 stream id><pcm16le>`, where stream 0 is the mix.
+
+Two AudioContexts, and the reason is a trap worth naming. **Chrome hands WebRTC a silent track from a
+`MediaStreamAudioDestinationNode` whose context is not at the browser's native sample rate.** No error, in
+the page or on the wire — just perfectly formed, perfectly empty audio. Roger ran at 24 kHz and was mute
+in every meeting. So the outbound context runs at whatever rate the browser wants and we resample into it,
+while the inbound context runs at 24 kHz, where `createMediaStreamSource` resamples for free and in better
+quality than we would manage by hand. `tests/test_browser_audio.py` pins this down with a real WebRTC
+loopback in a real browser, because no unit test could have caught it.
+
+Adding a platform is a `Platform` subclass: press these buttons, read this state. Adding a *consumer* --
+a recorder, a note-taker, something that watches for a keyword -- is a subscription:
+
+```python
+meeting.on(Event.AUDIO, my_handler)
 ```
 
 ## One session does the hard part
@@ -73,8 +109,8 @@ it, so the far end always had slack; here it has none, and a stall mid-word is h
 
 So output is buffered and *paced*: hold `OUTPUT_BUFFER_MS` of **speech** (silence does not count, and
 counting it was a real bug), release it, then emit at a steady 100 ms cadence so bursty input leaves as an
-even stream. Everything runs at 24 kHz, GPT-Live's native rate and the one Attendee wants for an OpenAI
-voice, so no sample is resampled anywhere in the path.
+even stream. The path runs at 24 kHz, GPT-Live's native rate, from the capture tap all the way to the
+speaker and back.
 
 ## What is deliberately absent
 
@@ -91,11 +127,11 @@ voice, so no sample is resampled anywhere in the path.
 |---|---|
 | `cli.py` | the `roger` command, and `doctor` |
 | `config.py` | every setting, read from the environment |
-| `server.py` | aiohttp app, the Attendee WebSocket, the quick tunnel |
+| `server.py` | aiohttp app: the control API, the monitor page, the meeting's audio socket |
 | `bridge.py` | the orchestrator: audio in, tools out, speaker attribution |
 | `live.py` | the GPT-Live session and its protocol |
 | `speaker.py` | paced, buffered audio back to the meeting |
-| `attendee.py` | the meeting-bot API client |
+| `meeting/` | joining calls: the interface, the browser participant, the platforms |
 | `context.py`, `sessions.py` | finding, reading and summarising coding sessions |
 | `tools.py` | read-only repository search, and the meeting chat |
 | `prompts.py` | every prompt, in one place |
